@@ -279,6 +279,12 @@ CONTAINS
                                                             interDEV1, interDEV2, &
                                                             constraint_c, & ! aeph
                                                             constraint_c_prev ! aeph: previous outer-iter dummy |c|
+      ! signed-overlap multiplier method
+      LOGICAL                                            :: mult_on
+      INTEGER                                            :: stateJ, cur_state, ispin, &
+                                                            idet, nmos
+      REAL(KIND=dp)                                      :: residual, residual_prev, &
+                                                            gauge_sign, lambda_dual
       ! aeph: the det(phi) threshold is read from input (tidft_env%eps_det, default 1.0E-10)
       !REAL(KIND=dp), PARAMETER                           :: tau_c  ! aeph: ALM decrease ratio for mu in tidft_env%alm_decrease_ratio
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -315,6 +321,17 @@ CONTAINS
       ! vary both intra and inter strengths together
       iteration = 0
       constraint_c_prev = -1.0_dp ! aeph: initial, no previous |c| yet
+      ! signed-overlap multiplier method: active only for excited states
+      ! (previous states are frozen in the state-by-state optimization)
+      mult_on = tidft_env%multiplier_component .AND. &
+                tidft_env%loss_function_components(3) .AND. &
+                tidft_env%nstates .GT. 1
+      cur_state = tidft_env%nstates
+      residual = 0.0_dp
+      residual_prev = -1.0_dp
+      gauge_sign = 1.0_dp
+      tidft_env%overlap_multipliers(:) = 0.0_dp
+      tidft_env%gauge_ref_set = .FALSE.
       ! aeph: we reset mu to the input value at each penalty-strength pass (per state)
       IF (tidft_env%loss_function_components(4) .AND. &
          tidft_env%loss_function_components(3)) THEN
@@ -359,6 +376,12 @@ CONTAINS
             ENDDO
             WRITE (unit_nr, '(T2,A49,F30.10)') "INTERstate penalty strength:", &
                tidft_env%interstate_nonorthogonality_penalty_coeff
+            IF (mult_on) THEN
+               DO stateJ = 1, cur_state - 1
+                  WRITE (unit_nr, '(T2,A49,I6,F24.10)') "State and its overlap multiplier:", stateJ, &
+                     tidft_env%overlap_multipliers(stateJ)
+               ENDDO
+            ENDIF
             IF (tidft_env%loss_function_components(4) .AND. &
                 tidft_env%loss_function_components(3)) THEN
                WRITE (unit_nr, '(T2,A49,F30.10)') "Augmented penalty strength:", &
@@ -411,6 +434,12 @@ CONTAINS
             WRITE (unit_nr, '(T2,A19,F30.10,F30.10)') "|Phi-I|_max:", &
                tidft_env%interstate_nonorthogonality_penalty_coeff, &
                tidft_env%max_norm_mat_phi_mI
+            IF (mult_on) THEN
+               ! residual of the current row max_J|g_IJ| and the part of
+               ! -ln det(Phi) that belongs to the current state
+               WRITE (unit_nr, '(T2,A19,ES30.6,ES30.6)') "ROW-RESIDUAL, C_I:", &
+                  tidft_env%multiplier_residual, tidft_env%schur_constraint
+            ENDIF
             IF (tidft_env%loss_function_components(4) .AND. &
                tidft_env%loss_function_components(3)) THEN
                !aeph:  det_mat_phi already checked / deferred if < eps_det later; for print, guard:
@@ -435,19 +464,33 @@ CONTAINS
          ! aeph: original waits until NSTEPS_STRENGTH, then checks |Phi-I|_max;
          ! aeph: ALM exits as soon as the constraint is satisfied, but only
          ! aeph: after a final pass at the tight EPS_ERROR (jump to it if still loose)
-         IF (tidft_env%max_norm_mat_phi_mI .LE. tidft_env%allowed_max_norm_phi_mI &
-             .OR. .NOT. tidft_env%loss_function_components(3)) THEN
-            IF (tidft_env%loss_function_components(4)) THEN
-               IF (current_eps_scf .LE. save_eps_scf*(1.0_dp + 1.0E-12_dp)) THEN
-                  EXIT
-               ELSE
-                  ! aeph: constraint ok but orbitals only loosely converged;
-                  ! aeph: skip penalty updates and re-polish at the tight tolerance
-                  current_eps_scf = save_eps_scf
-                  CYCLE
-               ENDIF
-            ELSE IF (iteration .GE. tidft_env%nsteps_penalty_strength) THEN
+         IF (mult_on) THEN
+            ! signed-overlap multiplier method: converged when the current-row
+            ! residual is below the threshold and the orbitals are tightly converged
+            residual = tidft_env%multiplier_residual
+            IF (residual .LE. tidft_env%allowed_max_norm_phi_mI .AND. &
+                current_eps_scf .LE. save_eps_scf*(1.0_dp + 1.0E-12_dp)) THEN
                EXIT
+            ENDIF
+            IF (iteration .GE. tidft_env%multiplier_max_iter) THEN
+               CPWARN("MULTIPLIER_MAX_ITER reached before the interstate constraint was satisfied")
+               EXIT
+            ENDIF
+         ELSE
+            IF (tidft_env%max_norm_mat_phi_mI .LE. tidft_env%allowed_max_norm_phi_mI &
+                .OR. .NOT. tidft_env%loss_function_components(3)) THEN
+               IF (tidft_env%loss_function_components(4)) THEN
+                  IF (current_eps_scf .LE. save_eps_scf*(1.0_dp + 1.0E-12_dp)) THEN
+                     EXIT
+                  ELSE
+                     ! aeph: constraint ok but orbitals only loosely converged;
+                     ! aeph: skip penalty updates and re-polish at the tight tolerance
+                     current_eps_scf = save_eps_scf
+                     CYCLE
+                  ENDIF
+               ELSE IF (iteration .GE. tidft_env%nsteps_penalty_strength) THEN
+                  EXIT
+               ENDIF
             ENDIF
          ENDIF
 
@@ -455,7 +498,19 @@ CONTAINS
          ! about as accurate as the current constraint violation. Converging
          ! orbitals beyond |c| wastes PCG iterations: the next lambda update
          ! moves the minimum by that much anyway.
-         IF (alm_on .AND. .NOT. alm_deferred) THEN
+         IF (mult_on) THEN
+            ! inexact method of multipliers: the next inner optimization is
+            ! converged to a fraction of the current residual, never looser
+            ! than the previous one (an inexact solve limits the residual and
+            ! corrupts the dual update), and to EPS_ERROR for the final polish
+            IF (residual .LE. tidft_env%allowed_max_norm_phi_mI) THEN
+               current_eps_scf = save_eps_scf
+            ELSE
+               current_eps_scf = MAX(save_eps_scf, &
+                                    MIN(current_eps_scf, &
+                                        tidft_env%multiplier_inner_tol_factor * residual))
+            ENDIF
+         ELSE IF (alm_on .AND. .NOT. alm_deferred) THEN
             current_eps_scf = MAX(save_eps_scf, &
                                  MIN(tidft_env%loose_eps_scf, ABS(constraint_c)))
          ELSE IF (iteration .LT. tidft_env%nsteps_penalty_strength) THEN
@@ -504,7 +559,39 @@ CONTAINS
          ! is on; component 3 controls the linear interstate term separately
          ! aeph: Compare component (3) (4) both of them need to be present 
 
-         IF (alm_on .AND. .NOT. alm_deferred) THEN
+         IF (mult_on) THEN
+            ! gauge-sign guard: flip the multipliers if the orbitals of the
+            ! current state changed sign since the last dual update
+            CALL multiplier_gauge_sign(tidft_env, gauge_sign)
+            IF (gauge_sign .LT. 0.0_dp .AND. unit_nr > 0) THEN
+               WRITE (unit_nr, '(T2,A)') &
+                  "WARNING: sign flip of the current-state orbitals detected, multipliers flipped"
+            ENDIF
+            ! dual update (method of multipliers on the signed overlaps):
+            !   mu_J <- mu_J - 2*lambda_dual*(Phi~^-1)_JI
+            ! where (Phi~^-1)_JI = SQRT(Phi_II*Phi_JJ)*(Phi^-1)_JI is the inverse of
+            ! the normalized overlap matrix; this is exact for any frozen block of
+            ! previous states and reduces to mu_J + 2*lambda*g_IJ for small overlaps
+            lambda_dual = tidft_env%interstate_nonorthogonality_penalty_coeff - &
+                          tidft_env%multiplier_curvature_shift
+            IF (lambda_dual .LE. 0.0_dp) &
+               lambda_dual = tidft_env%interstate_nonorthogonality_penalty_coeff
+            DO stateJ = 1, cur_state - 1
+               tidft_env%overlap_multipliers(stateJ) = &
+                  gauge_sign * tidft_env%overlap_multipliers(stateJ) - &
+                  2.0_dp * lambda_dual * &
+                  SQRT(tidft_env%mat_phi(cur_state,cur_state) * tidft_env%mat_phi(stateJ,stateJ)) * &
+                  tidft_env%mat_phi_inv(stateJ,cur_state)
+            ENDDO
+            ! safeguard: grow lambda only if the residual failed to decrease
+            IF (residual_prev .GE. 0.0_dp .AND. &
+                residual .GT. tidft_env%multiplier_safeguard_ratio * residual_prev) THEN
+               tidft_env%interstate_nonorthogonality_penalty_coeff = &
+                  tidft_env%interstate_nonorthogonality_penalty_coeff * &
+                  ABS(tidft_env%penalty_strength_inc_factor)
+            ENDIF
+            residual_prev = residual
+         ELSE IF (alm_on .AND. .NOT. alm_deferred) THEN
             !aeph: ALM active dual ascent step
             tidft_env%interstate_nonorthogonality_penalty_coeff = &
                tidft_env%interstate_nonorthogonality_penalty_coeff + &
@@ -569,13 +656,115 @@ CONTAINS
          WRITE (unit_nr, '(T2,A59,F20.10)') &
             print_string, tidft_env%interstate_nonorthogonality_penalty_coeff
 
+         IF (mult_on) THEN
+            print_string = "State and final overlap multiplier:"
+            DO stateJ = 1, cur_state - 1
+               WRITE (unit_nr, '(T2,A54,I5,F20.10)') print_string, stateJ, &
+                  tidft_env%overlap_multipliers(stateJ)
+            ENDDO
+            print_string = "Final current-row residual max|g_IJ|:"
+            WRITE (unit_nr, '(T2,A59,ES20.6)') &
+               print_string, tidft_env%multiplier_residual
+         ENDIF
+
          WRITE (unit_nr, '(T2,A)') REPEAT("-", 79)
 
+      ENDIF
+
+      ! release the gauge reference copy of the current state's MOs
+      IF (ALLOCATED(tidft_env%mat_t_gauge_ref)) THEN
+         IF (tidft_env%gauge_ref_set) THEN
+            idet = 1
+            IF (tidft_env%triplet_correction) idet = 2
+            DO ispin = 1, tidft_env%nspins
+               nmos = tidft_env%e_states(cur_state)%slater_det(idet)%nelectrons_ab(ispin)
+               IF (nmos .GT. 0) CALL dbcsr_release(tidft_env%mat_t_gauge_ref(ispin))
+            ENDDO
+         ENDIF
+         DEALLOCATE(tidft_env%mat_t_gauge_ref)
+         tidft_env%gauge_ref_set = .FALSE.
       ENDIF
 
       tidft_env%tidft_optimizer_pcg%eps_error = save_eps_scf
 
    END SUBROUTINE penalty_strength_variation
+
+! **************************************************************************************************
+!> \brief Detects a sign (gauge) flip of the current state's MOs since the last dual update
+!>        of the signed-overlap multipliers. The sign is that of PROD_spin det(T_ref^T S T_new),
+!>        which is +1 for a continuous deformation of the orbitals and -1 if an odd number
+!>        of orbital columns changed sign. The reference copy of the MOs is then updated.
+!> \param tidft_env ...
+!> \param gauge_sign - +1 or -1
+!> \par History
+!>       2026.10 created [Rustam Z Khaliullin]
+! **************************************************************************************************
+   SUBROUTINE multiplier_gauge_sign(tidft_env, gauge_sign)
+
+      TYPE(tidft_env_type), INTENT(INOUT)                :: tidft_env
+      REAL(KIND=dp), INTENT(OUT)                         :: gauge_sign
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'multiplier_gauge_sign', &
+         routineP = moduleN//':'//routineN
+
+      INTEGER                                            :: cur_state, idet, ispin, nmos
+      REAL(KIND=dp)                                      :: det
+      TYPE(dbcsr_type)                                   :: tempNO, sigma_ref_new
+
+      gauge_sign = 1.0_dp
+      cur_state = tidft_env%nstates
+      ! the determinant used by the interstate term
+      idet = 1
+      IF (tidft_env%triplet_correction) idet = 2
+
+      IF (.NOT. ALLOCATED(tidft_env%mat_t_gauge_ref)) THEN
+         ALLOCATE(tidft_env%mat_t_gauge_ref(tidft_env%nspins))
+      ENDIF
+
+      DO ispin = 1, tidft_env%nspins
+
+         nmos = tidft_env%e_states(cur_state)%slater_det(idet)%nelectrons_ab(ispin)
+         IF (nmos .LE. 0) CYCLE
+
+         IF (tidft_env%gauge_ref_set) THEN
+            ! S.T_new
+            CALL dbcsr_create(tempNO, &
+                    template=tidft_env%e_states(cur_state)%slater_det(idet)%mat_t(ispin))
+            CALL dbcsr_multiply("N", "N", 1.0_dp, &
+                    tidft_env%mat_s, &
+                    tidft_env%e_states(cur_state)%slater_det(idet)%mat_t(ispin), &
+                    0.0_dp, tempNO, &
+                    filter_eps=tidft_env%eps_filter)
+            ! T_ref^T.S.T_new
+            CALL dbcsr_create(sigma_ref_new, &
+                    template=tidft_env%mat_sigma(cur_state,cur_state,idet,ispin))
+            CALL dbcsr_multiply("T", "N", 1.0_dp, &
+                    tidft_env%mat_t_gauge_ref(ispin), &
+                    tempNO, &
+                    0.0_dp, sigma_ref_new, &
+                    filter_eps=tidft_env%eps_filter)
+            CALL cp_dbcsr_determinant_generalized( &
+                    matrix = sigma_ref_new, &
+                    det = det, &
+                    para_env = tidft_env%para_env, &
+                    blacs_env = tidft_env%blacs_env)
+            IF (det .LT. 0.0_dp) gauge_sign = -gauge_sign
+            CALL dbcsr_release(tempNO)
+            CALL dbcsr_release(sigma_ref_new)
+         ELSE
+            CALL dbcsr_create(tidft_env%mat_t_gauge_ref(ispin), &
+                    template=tidft_env%e_states(cur_state)%slater_det(idet)%mat_t(ispin))
+         ENDIF
+
+         ! store the current MOs as the new reference
+         CALL dbcsr_copy(tidft_env%mat_t_gauge_ref(ispin), &
+                 tidft_env%e_states(cur_state)%slater_det(idet)%mat_t(ispin))
+
+      ENDDO
+
+      tidft_env%gauge_ref_set = .TRUE.
+
+   END SUBROUTINE multiplier_gauge_sign
 
 ! **************************************************************************************************
 !> \brief Optimization of MOs using PCG minimizers
@@ -711,7 +900,8 @@ CONTAINS
             ENDIF
 
             energy_function = loss_components(1)
-            penalty_func_new = loss_components(2) + loss_components(3) + loss_components(4)
+            penalty_func_new = loss_components(2) + loss_components(3) + loss_components(4) + &
+                               loss_components(5)
             objf_new = SUM(loss_components)
 
             ! STEP 6: Convergence
@@ -1093,7 +1283,9 @@ CONTAINS
                                                             constraint_c, lambda_eff, &
                                                             DetDiagonalSigma, penalty_stateI, &
                                                             DetDiagonalPhi, &
-                                                            determinant_spd
+                                                            determinant_spd, &
+                                                            multiplier_term, g_IJ, &
+                                                            mult_pair_factor, mult_self_factor
       ! aeph: old floor for det(Phi) 
       !REAL(KIND=dp), PARAMETER                          :: eps_det = 1.0E-10_dp
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -1115,6 +1307,7 @@ CONTAINS
                                                             intrastate_penalty_component, & 
                                                             augmented_penalty_component,  &
                                                             alm_active, & ! aeph: ALM gate warm up
+                                                            multiplier_term_on, &
                                                             not_evaluated
 
       ! GRADIENT
@@ -1186,6 +1379,12 @@ CONTAINS
       intrastate_penalty_component=tidft_env%loss_function_components(2)
       interstate_penalty_component=tidft_env%loss_function_components(3)
       augmented_penalty_component=tidft_env%loss_function_components(4) ! aeph
+      ! signed-overlap multiplier term for the current state (state-by-state only)
+      multiplier_term_on = tidft_env%multiplier_component .AND. &
+                           interstate_penalty_component .AND. &
+                           tidft_env%state_by_state .AND. &
+                           (nstates .GT. 1)
+      multiplier_term = 0.0_dp
 
       !! RZK: templates for looping over the key matrices
       !! orbital matrices
@@ -1739,11 +1938,33 @@ CONTAINS
          tidft_env%grad_wrt_inter_penalty_coeff = interstate_nonorthogonality_penalty / &
             tidft_env%interstate_nonorthogonality_penalty_coeff
 
+         ! Phi^-1 is needed by the gradient and by the multiplier term
+         tidft_env%mat_phi_inv(:,:)=tidft_env%mat_phi(:,:)
+         CALL matrix_invert_local(tidft_env%mat_phi_inv, nstates)
+
+         ! Signed-overlap multiplier term for the current state I = nstates
+         !   SUM_J mu_J * g_IJ,  g_IJ = Phi_IJ / SQRT(Phi_II * Phi_JJ)
+         ! together with the current-row residual max_J |g_IJ| and the
+         ! Schur-complement part of the constraint that belongs to state I,
+         !   -ln(1 - s^T A^-1 s) = ln(Phi_II * (Phi^-1)_II)
+         IF (multiplier_term_on) THEN
+            tidft_env%multiplier_residual = 0.0_dp
+            DO stateJ = 1, nstates - 1
+               g_IJ = tidft_env%mat_phi(nstates, stateJ) / &
+                      SQRT(tidft_env%mat_phi(nstates, nstates) * tidft_env%mat_phi(stateJ, stateJ))
+               multiplier_term = multiplier_term + tidft_env%overlap_multipliers(stateJ) * g_IJ
+               tidft_env%multiplier_residual = MAX(tidft_env%multiplier_residual, ABS(g_IJ))
+            ENDDO
+            tidft_env%schur_constraint = LOG(tidft_env%mat_phi(nstates, nstates) * &
+                                             tidft_env%mat_phi_inv(nstates, nstates))
+         ENDIF
+
       ENDIF ! interstate_penalty_component
 
       ! Pass the result up
       loss_components_out(3) = interstate_nonorthogonality_penalty
       loss_components_out(4) = augmented_nonorthogonality_penalty ! aeph
+      loss_components_out(5) = multiplier_term
 
       !!!!!!!!!!!!!!!!!!!!!!!!!
       ! GRADIENT CALCULATIONS
@@ -1763,9 +1984,9 @@ CONTAINS
                CALL dbcsr_set(gradient_out(stateI, ivar), 0.0_dp)
                IF (my_grad_conv) CALL dbcsr_set(gradient_convergence_out(stateI, ivar), 0.0_dp)
                !CINDY: make a copy for energy grad component
-               CALL dbcsr_create(energy_grad(stateI,ivar), template = gradient_convergence_out(stateI,ivar))
+               CALL dbcsr_create(energy_grad(stateI,ivar), template = gradient_out(stateI,ivar))
                CALL dbcsr_set(energy_grad(stateI, ivar), 0.0_dp)
-               CALL dbcsr_create(interstate_grad(stateI,ivar), template = gradient_convergence_out(stateI,ivar))
+               CALL dbcsr_create(interstate_grad(stateI,ivar), template = gradient_out(stateI,ivar))
                CALL dbcsr_set(interstate_grad(stateI, ivar), 0.0_dp)
                !IF (gradient_components) THEN
                !   CALL dbcsr_set(gradient_components_out(stateI, ivar, 1), 0.0_dp)
@@ -1812,16 +2033,7 @@ CONTAINS
          ENDDO ! stateI
       ENDDO ! ispin
 
-      IF (interstate_penalty_component) THEN
-         tidft_env%mat_phi_inv(:,:)=tidft_env%mat_phi(:,:)
-         CALL matrix_invert_local(tidft_env%mat_phi_inv, nstates)
-         ! Print inverted phi
-         !WRITE (*,*) "Phi inv matrix"
-         !DO ivar = 1, nstates
-         !   WRITE (*,*) tidft_env%mat_phi_inv(ivar, 1:nstates)
-         !ENDDO
-         !WRITE (*,*)
-      ENDIF
+      ! Phi^-1 (mat_phi_inv) is computed together with the interstate penalty value
 
       ALLOCATE(gradient_temp(3))
 
@@ -2157,9 +2369,19 @@ CONTAINS
                                  ELSE
                                     opposite_spin = 1
                                  ENDIF
+                                 ! Weight of the pair term: the penalty part (Phi^-1)_JI plus
+                                 ! the multiplier part mu_J/SQRT(Phi_II*Phi_JJ), folded into the
+                                 ! overall factor -2*lambda_eff applied below
+                                 mult_pair_factor = 0.0_dp
+                                 IF (multiplier_term_on .AND. stateJ .LT. stateI) THEN
+                                    mult_pair_factor = tidft_env%overlap_multipliers(stateJ) / &
+                                       SQRT(tidft_env%mat_phi(stateI,stateI) * &
+                                            tidft_env%mat_phi(stateJ,stateJ)) / &
+                                       (-2.0_dp * lambda_eff)
+                                 ENDIF
                                  CALL dbcsr_scale(tempOO2, &
                                          tidft_env%mat_phi_spin(stateJ,stateI,opposite_spin) * &
-                                         tidft_env%mat_phi_inv(stateJ,stateI) )
+                                         (tidft_env%mat_phi_inv(stateJ,stateI) + mult_pair_factor) )
 
                                  ! S.T_Jindex
                                  ! RZK-WARNING: optimize N^2 re-evaluations to N
@@ -2195,7 +2417,12 @@ CONTAINS
                      ! This means compute for triplet_correction==.FALSE. .OR. idet.EQ.2
                      IF ( .NOT.(tidft_env%triplet_correction .AND. idet.EQ.1) ) THEN
 
-                        CALL dbcsr_add(mat_g_inter(stateI, ispin), STsiginv, 1.0_dp, -1.0_dp)
+                        ! Normalization term: 2*lambda from the penalty minus SUM_J mu_J*g_IJ
+                        ! from the multiplier term, folded into the factor -2*lambda_eff below
+                        mult_self_factor = 1.0_dp
+                        IF (multiplier_term_on) &
+                           mult_self_factor = 1.0_dp - multiplier_term/(2.0_dp*lambda_eff)
+                        CALL dbcsr_add(mat_g_inter(stateI, ispin), STsiginv, 1.0_dp, -mult_self_factor)
                         ! aeph: original scaling kept for reference/testing
                         !CALL dbcsr_scale(mat_g_inter(stateI, ispin), &
                         !        -2.0_dp*tidft_env%interstate_nonorthogonality_penalty_coeff)
@@ -2400,6 +2627,18 @@ CONTAINS
                DetDiagonalPhi, &
                tidft_env%det_mat_phi
 
+            ! multiplier term: columns are max|mu|, value, -, row residual, Schur C_I
+            IF (multiplier_term_on) THEN
+               WRITE (loss_unit_nr, '(T2,A17,A3,ES10.2,F19.7,A10,ES10.2,ES10.2)') &
+                  "MULTIPLIER", &
+                  "-", &
+                  MAXVAL(ABS(tidft_env%overlap_multipliers(1:nstates-1))), &
+                  multiplier_term, &
+                  "-", &
+                  tidft_env%multiplier_residual, &
+                  tidft_env%schur_constraint
+            ENDIF
+
          ENDIF ! interstate_penalty_component
 
       ENDIF ! loss_unit_nr
@@ -2425,6 +2664,10 @@ CONTAINS
             "Sum AUGMENTED", &
             augmented_nonorthogonality_penalty, &
             "-"
+         WRITE (loss_unit_nr, '(T2,A30,F19.7,A10)') &
+            "Sum MULTIPLIER", &
+            multiplier_term, &
+            "-"
          WRITE (loss_unit_nr, '(T2,A)') REPEAT("-", 79)
          ! aeph: original loss function total (kept for reference/testing)
          !WRITE (loss_unit_nr, '(T2,A30,F19.7)') "Loss function", &
@@ -2435,7 +2678,8 @@ CONTAINS
             obj_energy + &
             intrastate_nonorthogonality_penalty + &
             interstate_nonorthogonality_penalty + &
-            augmented_nonorthogonality_penalty ! aeph
+            augmented_nonorthogonality_penalty + & ! aeph
+            multiplier_term
          !WRITE (loss_unit_nr, '(T2,A)') REPEAT("-", 79)
          WRITE (loss_unit_nr, '()')
       ENDIF

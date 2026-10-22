@@ -167,9 +167,24 @@ CONTAINS
           .NOT. tidft_env%loss_function_components(3)) THEN
          CPABORT("AUGMENTED_COMPONENT requires INTERSTATE_COMPONENT=.TRUE.")
       ENDIF
+      ! signed-overlap multiplier term (component 5)
+      CALL section_vals_val_get(tidft_section, &
+              "MULTIPLIER_COMPONENT", &
+              l_val=tidft_env%multiplier_component)
+      IF (tidft_env%multiplier_component) THEN
+         IF (.NOT. tidft_env%loss_function_components(3)) THEN
+            CPABORT("MULTIPLIER_COMPONENT requires INTERSTATE_COMPONENT=.TRUE.")
+         ENDIF
+         IF (tidft_env%loss_function_components(4)) THEN
+            CPABORT("MULTIPLIER_COMPONENT cannot be combined with AUGMENTED_COMPONENT")
+         ENDIF
+      ENDIF
       CALL section_vals_val_get(tidft_section, &
               "STATE_BY_STATE", &
               l_val=tidft_env%state_by_state)
+      IF (tidft_env%multiplier_component .AND. .NOT. tidft_env%state_by_state) THEN
+         CPABORT("MULTIPLIER_COMPONENT requires STATE_BY_STATE=.TRUE.")
+      ENDIF
       CALL section_vals_val_get(tidft_section, &
               "PRE_ORTHOGONALIZE_STATES", &
               l_val=tidft_env%pre_orthogonalize_states)
@@ -272,6 +287,21 @@ CONTAINS
       CALL section_vals_val_get(penalty_section, &
                                 "LOOSE_EPS_SCF", &
                                 r_val=tidft_env%loose_eps_scf)
+      ! signed-overlap multiplier term settings
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_SAFEGUARD_RATIO", &
+                                r_val=tidft_env%multiplier_safeguard_ratio)
+      tidft_env%multiplier_safeguard_ratio = ABS(tidft_env%multiplier_safeguard_ratio)
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_CURVATURE_SHIFT", &
+                                r_val=tidft_env%multiplier_curvature_shift)
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_INNER_TOL_FACTOR", &
+                                r_val=tidft_env%multiplier_inner_tol_factor)
+      tidft_env%multiplier_inner_tol_factor = ABS(tidft_env%multiplier_inner_tol_factor)
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_MAX_ITER", &
+                                i_val=tidft_env%multiplier_max_iter)
 
       ! CINDY: Pass input from WF_GUESS section
       WF_guess_section => section_vals_get_subs_vals(tidft_section, "WF_GUESS")
@@ -421,6 +451,15 @@ CONTAINS
       ALLOCATE(tidft_env%mat_phi_spin(nstates,nstates,nspins))
       ALLOCATE(tidft_env%mat_phi(nstates,nstates))
       ALLOCATE(tidft_env%mat_phi_inv(nstates,nstates))
+      ! signed-overlap multipliers (one per state, used for states J < current I)
+      ALLOCATE(tidft_env%overlap_multipliers(nstates))
+      tidft_env%overlap_multipliers(:) = 0.0_dp
+      tidft_env%multiplier_residual = 0.0_dp
+      tidft_env%schur_constraint = 0.0_dp
+      tidft_env%gauge_ref_set = .FALSE.
+      IF (tidft_env%multiplier_component .AND. nspins .NE. 2) THEN
+         CPABORT("MULTIPLIER_COMPONENT requires two spin channels (nspins=1 is not supported)")
+      ENDIF
       ALLOCATE(tidft_env%omega_intra(nstates,nspins))
       ALLOCATE(tidft_env%det_sig_diagonal(nstates,nspins))
       ALLOCATE(tidft_env%det_sig_normalized(nstates,nspins))
@@ -821,6 +860,7 @@ CONTAINS
       DEALLOCATE(tidft_env%grad_wrt_penalty_coeff)
       DEALLOCATE(tidft_env%mat_phi_inv)
       DEALLOCATE(tidft_env%mat_phi)
+      IF (ALLOCATED(tidft_env%overlap_multipliers)) DEALLOCATE(tidft_env%overlap_multipliers)
       DEALLOCATE(tidft_env%mat_phi_spin)
       DEALLOCATE(tidft_env%e_states)
       DEALLOCATE(tidft_env%omega_intra)
@@ -1041,6 +1081,7 @@ CONTAINS
       DEALLOCATE(tidft_env%grad_wrt_penalty_coeff)
       DEALLOCATE(tidft_env%mat_phi_inv)
       DEALLOCATE(tidft_env%mat_phi)
+      IF (ALLOCATED(tidft_env%overlap_multipliers)) DEALLOCATE(tidft_env%overlap_multipliers)
       DEALLOCATE(tidft_env%mat_phi_spin)
       DEALLOCATE(tidft_env%e_states)
 

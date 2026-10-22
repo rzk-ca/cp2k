@@ -184,6 +184,30 @@ MODULE tidft_types
       INTEGER                                            :: nsteps_penalty_strength
       REAL(KIND=dp)                                      :: loose_eps_scf
 
+      ! Signed-overlap Lagrange multipliers for the interstate orthogonality
+      ! constraints of the current state (loss function component 5).
+      ! One multiplier per previously optimized state J:
+      !   term = SUM_J mu_J * g_IJ,  g_IJ = Phi_IJ / SQRT(Phi_II * Phi_JJ)
+      LOGICAL                                            :: multiplier_component
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: overlap_multipliers
+      ! grow lambda only if the residual failed to drop by this ratio
+      REAL(KIND=dp)                                      :: multiplier_safeguard_ratio
+      ! estimated excitation energy used in the curvature-corrected dual step
+      REAL(KIND=dp)                                      :: multiplier_curvature_shift
+      ! inner tolerance for the next solve = this fraction of the current residual
+      ! (never looser than the previous solve, never tighter than EPS_ERROR)
+      REAL(KIND=dp)                                      :: multiplier_inner_tol_factor
+      INTEGER                                            :: multiplier_max_iter
+      ! residual of the current row, max_J |g_IJ|, and the Schur-complement
+      ! part of the constraint that belongs to the current state,
+      ! -ln(1 - s^T A^-1 s) = ln(Phi_II * (Phi^-1)_II)
+      REAL(KIND=dp)                                      :: multiplier_residual
+      REAL(KIND=dp)                                      :: schur_constraint
+      ! reference copy of the current state's MOs (one per spin) taken at the
+      ! last dual update; used to detect a sign (gauge) flip of the orbitals
+      TYPE(dbcsr_type), DIMENSION(:), ALLOCATABLE        :: mat_t_gauge_ref
+      LOGICAL                                            :: gauge_ref_set = .FALSE.
+
       ! dipole evaluation
       INTEGER                                            :: dipole_reference_type
       !REAL(kind=dp), DIMENSION(:), POINTER               :: dipole_reference_point

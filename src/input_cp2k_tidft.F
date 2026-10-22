@@ -167,6 +167,19 @@ CONTAINS
                           lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_COMPONENT", &
+                          description="Turn on the signed-overlap Lagrange multiplier term for the "// &
+                          "interstate orthogonality constraints (loss function component 5). "// &
+                          "One multiplier per previously optimized state is updated after each "// &
+                          "inner optimization (method of multipliers), so that the states become "// &
+                          "orthogonal at a finite INTERSTATE_NON_PENALTY_STRENGTH. "// &
+                          "Requires INTERSTATE_COMPONENT=.TRUE. and STATE_BY_STATE=.TRUE.; "// &
+                          "cannot be combined with AUGMENTED_COMPONENT.", &
+                          usage="MULTIPLIER_COMPONENT .TRUE.", default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, name="INTRASTATE_COMPONENT", &
                           description="Turn on the intrastate nonorthogonality peanlty.", &
                           usage="INTRASTATE_COMPONENT .FALSE.", default_l_val=.TRUE., &
@@ -539,6 +552,45 @@ CONTAINS
                           "factor relative to the previous outer iteration (ALM safeguard ratio).", &
                           usage="AUGMENTED_RATIO 0.25", &
                           default_r_val=0.25_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_SAFEGUARD_RATIO", &
+                          description="Used with MULTIPLIER_COMPONENT. The interstate penalty strength "// &
+                          "is multiplied by PENALTY_STRENGTH_INCREASE_FACTOR only if the current-row "// &
+                          "residual max_J |g_IJ| failed to decrease by this ratio relative to the "// &
+                          "previous outer iteration.", &
+                          usage="MULTIPLIER_SAFEGUARD_RATIO 0.25", &
+                          default_r_val=0.25_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_CURVATURE_SHIFT", &
+                          description="Used with MULTIPLIER_COMPONENT. Estimated excitation energy "// &
+                          "(Hartree) of the current state above the ground state. The dual step "// &
+                          "uses 2*(lambda - shift) instead of 2*lambda, which is exact for the "// &
+                          "two-level model of the collapse. Zero gives the plain multiplier update.", &
+                          usage="MULTIPLIER_CURVATURE_SHIFT 0.0", &
+                          default_r_val=0.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_INNER_TOL_FACTOR", &
+                          description="Used with MULTIPLIER_COMPONENT. After each outer iteration the "// &
+                          "convergence criterion of the next inner optimization is set to this "// &
+                          "fraction of the current-row residual, but never looser than the previous "// &
+                          "criterion and never tighter than EPS_ERROR. Zero means every inner "// &
+                          "optimization is converged to EPS_ERROR.", &
+                          usage="MULTIPLIER_INNER_TOL_FACTOR 0.1", &
+                          default_r_val=0.1_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_MAX_ITER", &
+                          description="Used with MULTIPLIER_COMPONENT. Maximum number of outer "// &
+                          "(dual update) iterations per state.", &
+                          usage="MULTIPLIER_MAX_ITER 50", &
+                          default_i_val=50)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
