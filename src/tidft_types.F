@@ -198,6 +198,21 @@ MODULE tidft_types
       ! (never looser than the previous solve, never tighter than EPS_ERROR)
       REAL(KIND=dp)                                      :: multiplier_inner_tol_factor
       INTEGER                                            :: multiplier_max_iter
+      ! accelerated dual update: over-relaxed first step and per-pair secant steps
+      LOGICAL                                            :: multiplier_acceleration
+      REAL(KIND=dp)                                      :: multiplier_curvature_guess
+      REAL(KIND=dp)                                      :: multiplier_boost_max
+      REAL(KIND=dp)                                      :: multiplier_boost_min
+      REAL(KIND=dp)                                      :: multiplier_boost_damping
+      LOGICAL                                            :: multiplier_accel_single_pair
+      INTEGER                                            :: multiplier_secant_depth
+      REAL(KIND=dp)                                      :: multiplier_secant_noise
+      REAL(KIND=dp)                                      :: multiplier_step_max
+      ! per pair (I,J): signed overlap g_IJ after the current inner solve, the
+      ! multiplier used in and the overlap after the previous inner solve, and
+      ! the kind of the last dual step (0 first-order, 1 boosted, 2 secant)
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: mult_g_cur, mult_g_prev, mult_mu_prev
+      INTEGER, DIMENSION(:), ALLOCATABLE                 :: mult_step_kind
       ! residual of the current row, max_J |g_IJ|, and the Schur-complement
       ! part of the constraint that belongs to the current state,
       ! -ln(1 - s^T A^-1 s) = ln(Phi_II * (Phi^-1)_II)

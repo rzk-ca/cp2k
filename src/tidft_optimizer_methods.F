@@ -76,6 +76,14 @@ MODULE tidft_optimizer_methods
    ! CINDY:
    USE dm_ls_scf_types,                 ONLY: ls_scf_env_type
    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
+   USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm
+   USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
+                                              cp_fm_struct_release,&
+                                              cp_fm_struct_type
+   USE cp_fm_types,                     ONLY: cp_fm_create,&
+                                              cp_fm_get_submatrix,&
+                                              cp_fm_release,&
+                                              cp_fm_type
 !   USE tidft_env_methods,               ONLY: tidft_env_safe_deallocate_state
 #include "./base/base_uses.f90"
 
@@ -285,6 +293,19 @@ CONTAINS
                                                             idet, nmos
       REAL(KIND=dp)                                      :: residual, residual_prev, &
                                                             gauge_sign, lambda_dual
+      ! accelerated dual update (quasi-Newton on the dual function)
+      LOGICAL                                            :: accel_prev, slope_bad, hinv_set
+      INTEGER                                            :: npairs, jmax, jacc, jacc_prev, &
+                                                            nhist, mdepth, ih, info
+      CHARACTER(LEN=6)                                   :: kind_str
+      REAL(KIND=dp)                                      :: cmin, pfac2, eta, step_factor, &
+                                                            dg_norm, g_norm, gp_norm, dot_mg, scal, &
+                                                            eps_reg
+      REAL(KIND=dp), DIMENSION(:,:), ALLOCATABLE         :: dm_hist, dg_hist, rmat, gram
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: dfo_vec, dmu_vec, gcur_vec, muused_vec, &
+                                                            dg_vec, dmuh_vec, eta_vec, h0diag, coef, &
+                                                            corr_vec
+      LOGICAL, DIMENSION(:), ALLOCATABLE                 :: active, accel_now, umask
       ! aeph: the det(phi) threshold is read from input (tidft_env%eps_det, default 1.0E-10)
       !REAL(KIND=dp), PARAMETER                           :: tau_c  ! aeph: ALM decrease ratio for mu in tidft_env%alm_decrease_ratio
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -331,7 +352,22 @@ CONTAINS
       residual_prev = -1.0_dp
       gauge_sign = 1.0_dp
       tidft_env%overlap_multipliers(:) = 0.0_dp
+      tidft_env%mult_g_prev(:) = 0.0_dp
+      tidft_env%mult_mu_prev(:) = 0.0_dp
+      tidft_env%mult_step_kind(:) = 0
       tidft_env%gauge_ref_set = .FALSE.
+      ! work arrays of the accelerated dual update (pairs of the current state)
+      npairs = MAX(cur_state - 1, 1)
+      mdepth = MAX(1, tidft_env%multiplier_secant_depth)
+      ALLOCATE(dm_hist(npairs,mdepth), dg_hist(npairs,mdepth), rmat(npairs,mdepth), gram(mdepth,mdepth), &
+               dfo_vec(npairs), dmu_vec(npairs), gcur_vec(npairs), muused_vec(npairs), dg_vec(npairs), &
+               dmuh_vec(npairs), eta_vec(npairs), h0diag(npairs), coef(mdepth), corr_vec(npairs), &
+               active(npairs), accel_now(npairs), umask(npairs))
+      eta_vec(:) = 1.0_dp
+      h0diag(:) = 0.0_dp
+      hinv_set = .FALSE.
+      nhist = 0
+      jacc_prev = 0
       ! aeph: we reset mu to the input value at each penalty-strength pass (per state)
       IF (tidft_env%loss_function_components(4) .AND. &
          tidft_env%loss_function_components(3)) THEN
@@ -576,16 +612,217 @@ CONTAINS
                           tidft_env%multiplier_curvature_shift
             IF (lambda_dual .LE. 0.0_dp) &
                lambda_dual = tidft_env%interstate_nonorthogonality_penalty_coeff
-            DO stateJ = 1, cur_state - 1
-               tidft_env%overlap_multipliers(stateJ) = &
-                  gauge_sign * tidft_env%overlap_multipliers(stateJ) - &
-                  2.0_dp * lambda_dual * &
+            ! Dual update. First-order (Hestenes-Powell) increments: the effective
+            ! multipliers that the penalty carries at the inner minimum.
+            npairs = cur_state - 1
+            accel_prev = ANY(tidft_env%mult_step_kind(1:npairs) .GT. 0)
+            slope_bad = .FALSE.
+            DO stateJ = 1, npairs
+               dfo_vec(stateJ) = -2.0_dp * lambda_dual * &
                   SQRT(tidft_env%mat_phi(cur_state,cur_state) * tidft_env%mat_phi(stateJ,stateJ)) * &
                   tidft_env%mat_phi_inv(stateJ,cur_state)
+               ! multiplier used in the inner solve just completed and its response
+               ! (the signed overlap), both in the current gauge
+               muused_vec(stateJ) = gauge_sign * tidft_env%overlap_multipliers(stateJ)
+               gcur_vec(stateJ) = tidft_env%mult_g_cur(stateJ)
             ENDDO
-            ! safeguard: grow lambda only if the residual failed to decrease
-            IF (residual_prev .GE. 0.0_dp .AND. &
-                residual .GT. tidft_env%multiplier_safeguard_ratio * residual_prev) THEN
+            dmu_vec(1:npairs) = dfo_vec(1:npairs)
+            tidft_env%mult_step_kind(1:npairs) = 0
+            IF (tidft_env%multiplier_acceleration) THEN
+               ! Quasi-Newton step on the dual function for the pairs that limit
+               ! convergence, dmu = H g, with H an approximation of minus the inverse
+               ! Jacobian dg/dmu of the overlaps with respect to the multipliers. The
+               ! first-order step is the gradient step H = 2*lambda, whose contraction
+               ! is k/(k + 2*lambda*P^2) with k the energy curvature along the smallest
+               ! principal cosine of the pair and P the product of the other cosines.
+               ! The model H0 is the diagonal 2*lambda*eta_J with
+               ! eta_J = 1 + k_guess/(2*lambda*P_J^2) (only for pairs with a small
+               ! second cosine, damped). The last MULTIPLIER_SECANT_DEPTH multiplier
+               ! changes dM and overlap responses dG are fitted at once (multisecant,
+               ! least squares): H = H0 + (-dM - H0 dG) (dG^T dG + eps)^-1 dG^T, which
+               ! resolves the coupling among n pairs after n updates and reduces to
+               ! the rank-one Broyden update for a depth of one. With
+               ! MULTIPLIER_ACCEL_SINGLE_PAIR only one pair is accelerated per update
+               ! and only its own response enters the fit.
+               active(1:npairs) = ABS(gcur_vec(1:npairs)) .GT. tidft_env%allowed_max_norm_phi_mI
+               IF (hinv_set .AND. iteration .GT. 1) THEN
+                  umask(1:npairs) = .TRUE.
+                  IF (tidft_env%multiplier_accel_single_pair) THEN
+                     ! only the pair designated at the previous update (whatever
+                     ! kind of step it took) enters the correction of H
+                     umask(1:npairs) = .FALSE.
+                     IF (jacc_prev .GE. 1 .AND. jacc_prev .LE. npairs) umask(jacc_prev) = .TRUE.
+                  ENDIF
+                  dg_vec(1:npairs) = 0.0_dp
+                  dmuh_vec(1:npairs) = 0.0_dp
+                  g_norm = 0.0_dp
+                  gp_norm = 0.0_dp
+                  DO stateJ = 1, npairs
+                     IF (.NOT. umask(stateJ)) CYCLE
+                     dg_vec(stateJ) = gcur_vec(stateJ) - gauge_sign * tidft_env%mult_g_prev(stateJ)
+                     dmuh_vec(stateJ) = muused_vec(stateJ) - gauge_sign * tidft_env%mult_mu_prev(stateJ)
+                     g_norm = g_norm + gcur_vec(stateJ)**2
+                     gp_norm = gp_norm + tidft_env%mult_g_prev(stateJ)**2
+                  ENDDO
+                  g_norm = SQRT(g_norm)
+                  gp_norm = SQRT(gp_norm)
+                  dg_norm = SQRT(SUM(dg_vec(1:npairs)**2))
+                  IF (ANY(umask(1:npairs)) .AND. SQRT(SUM(dmuh_vec(1:npairs)**2)) .GT. 1.0E-14_dp) THEN
+                     IF (dg_norm .GT. tidft_env%multiplier_secant_noise * MAX(g_norm, gp_norm)) THEN
+                        dot_mg = SUM(dmuh_vec(1:npairs) * dg_vec(1:npairs))
+                        IF (dot_mg .LT. 0.0_dp) THEN
+                           ! append the (dmu, dg) pair to the history (newest last)
+                           IF (nhist .LT. mdepth) THEN
+                              nhist = nhist + 1
+                           ELSE
+                              DO ih = 1, mdepth - 1
+                                 dm_hist(1:npairs,ih) = dm_hist(1:npairs,ih+1)
+                                 dg_hist(1:npairs,ih) = dg_hist(1:npairs,ih+1)
+                              ENDDO
+                           ENDIF
+                           dm_hist(1:npairs,nhist) = dmuh_vec(1:npairs)
+                           dg_hist(1:npairs,nhist) = dg_vec(1:npairs)
+                        ELSE
+                           ! the overlaps moved with the multipliers instead of against
+                           ! them: the inner problem does not confine the state along the
+                           ! direction of the last step; keep the first-order step and let
+                           ! the safeguard raise the penalty strength
+                           slope_bad = .TRUE.
+                           jmax = MAXLOC(ABS(dmuh_vec(1:npairs)), 1)
+                           IF (unit_nr > 0) WRITE (unit_nr, '(T2,A,ES11.3,A,I5)') &
+                              "WRONG-SIGN DUAL RESPONSE: dmu.dg =", dot_mg, "  largest multiplier change for J =", jmax
+                        ENDIF
+                     ELSE
+                        ! no measurable response: the boosted steps were too small,
+                        ! enlarge the model factor of the pairs that took them
+                        DO stateJ = 1, npairs
+                           IF (umask(stateJ) .AND. tidft_env%mult_step_kind(stateJ) .EQ. 1) THEN
+                              eta_vec(stateJ) = MIN(4.0_dp * eta_vec(stateJ), tidft_env%multiplier_boost_max)
+                              h0diag(stateJ) = 2.0_dp * lambda_dual * eta_vec(stateJ)
+                           ENDIF
+                        ENDDO
+                     ENDIF
+                  ENDIF
+               ENDIF
+               IF (ANY(active(1:npairs)) .AND. .NOT. hinv_set .AND. .NOT. slope_bad) THEN
+                  ! model diagonal from the principal cosines of each pair
+                  nhist = 0
+                  DO stateJ = 1, npairs
+                     CALL smallest_principal_cosine(tidft_env, cur_state, stateJ, cmin)
+                     IF (cmin .GE. ABS(gcur_vec(stateJ)) .AND. cmin .GT. 0.0_dp) THEN
+                        pfac2 = (gcur_vec(stateJ) / cmin)**2
+                     ELSE
+                        pfac2 = 1.0_dp
+                     ENDIF
+                     eta = 1.0_dp + tidft_env%multiplier_curvature_guess / (2.0_dp * lambda_dual * pfac2)
+                     ! the curvature guess describes pairs with a small second cosine;
+                     ! for the others the plain first-order step is nearly exact
+                     IF (eta .LT. tidft_env%multiplier_boost_min) eta = 1.0_dp
+                     eta = MIN(MAX(eta, 1.0_dp), tidft_env%multiplier_boost_max)
+                     ! damped: an undershoot is completed by the next quasi-Newton step
+                     eta_vec(stateJ) = 1.0_dp + tidft_env%multiplier_boost_damping * (eta - 1.0_dp)
+                     h0diag(stateJ) = 2.0_dp * lambda_dual * eta_vec(stateJ)
+                  ENDDO
+                  hinv_set = .TRUE.
+               ENDIF
+               ! pairs to accelerate in this update
+               accel_now(1:npairs) = active(1:npairs)
+               IF (tidft_env%multiplier_accel_single_pair .AND. ANY(active(1:npairs))) THEN
+                  ! the pair designated at the previous update while it is above the
+                  ! threshold; otherwise the active pair whose first-order step is the
+                  ! least efficient (largest model factor, i.e. a small second cosine);
+                  ! otherwise the largest overlap
+                  jacc = 0
+                  IF (jacc_prev .GE. 1 .AND. jacc_prev .LE. npairs) THEN
+                     IF (active(jacc_prev)) jacc = jacc_prev
+                  ENDIF
+                  IF (jacc .EQ. 0) THEN
+                     jacc = MAXLOC(eta_vec(1:npairs), 1, MASK=active(1:npairs))
+                     IF (eta_vec(jacc) .LE. 1.0_dp + 1.0E-6_dp) jacc = MAXLOC(ABS(gcur_vec(1:npairs)), 1, MASK=active(1:npairs))
+                  ENDIF
+                  accel_now(1:npairs) = .FALSE.
+                  accel_now(jacc) = .TRUE.
+                  jacc_prev = jacc
+               ELSE
+                  jacc_prev = 0
+               ENDIF
+               tidft_env%mult_step_kind(1:npairs) = 0
+               IF (ANY(accel_now(1:npairs)) .AND. .NOT. slope_bad) THEN
+                  ! multisecant correction: corr = (-dM - H0 dG) (dG^T dG + eps)^-1 dG^T g
+                  corr_vec(1:npairs) = 0.0_dp
+                  IF (nhist .GT. 0) THEN
+                     g_norm = SQRT(SUM(gcur_vec(1:npairs)**2))
+                     eps_reg = (tidft_env%multiplier_secant_noise * g_norm)**2 + 1.0E-30_dp
+                     DO ih = 1, nhist
+                        rmat(1:npairs,ih) = -dm_hist(1:npairs,ih) - h0diag(1:npairs) * dg_hist(1:npairs,ih)
+                        coef(ih) = SUM(dg_hist(1:npairs,ih) * gcur_vec(1:npairs))
+                     ENDDO
+                     gram(1:nhist,1:nhist) = MATMUL(TRANSPOSE(dg_hist(1:npairs,1:nhist)), dg_hist(1:npairs,1:nhist))
+                     DO ih = 1, nhist
+                        gram(ih,ih) = gram(ih,ih) + eps_reg
+                     ENDDO
+                     CALL dpotrf('U', nhist, gram, mdepth, info)
+                     IF (info .EQ. 0) CALL dpotrs('U', nhist, 1, gram, mdepth, coef, mdepth, info)
+                     IF (info .EQ. 0) THEN
+                        corr_vec(1:npairs) = MATMUL(rmat(1:npairs,1:nhist), coef(1:nhist))
+                     ENDIF
+                  ENDIF
+                  DO stateJ = 1, npairs
+                     IF (.NOT. accel_now(stateJ)) CYCLE
+                     ! over-relaxed first-order step plus the learned correction
+                     dmu_vec(stateJ) = eta_vec(stateJ) * dfo_vec(stateJ) + corr_vec(stateJ)
+                     IF (ABS(corr_vec(stateJ)) .GT. 0.0_dp) THEN
+                        tidft_env%mult_step_kind(stateJ) = 2
+                        ! for an active pair a step against the first-order step means a
+                        ! corrupted Jacobian model: fall back to the first-order step
+                        IF (dmu_vec(stateJ) * dfo_vec(stateJ) .LT. 0.0_dp) THEN
+                           dmu_vec(stateJ) = dfo_vec(stateJ)
+                           tidft_env%mult_step_kind(stateJ) = 0
+                        ENDIF
+                     ELSE IF (eta_vec(stateJ) .GT. 1.0_dp + 1.0E-6_dp) THEN
+                        tidft_env%mult_step_kind(stateJ) = 1
+                     ENDIF
+                  ENDDO
+                  ! cap the change of the multipliers
+                  scal = MAXVAL(ABS(dmu_vec(1:npairs)), MASK=accel_now(1:npairs))
+                  IF (scal .GT. tidft_env%multiplier_step_max) THEN
+                     WHERE (accel_now(1:npairs)) dmu_vec(1:npairs) = dmu_vec(1:npairs) * &
+                        tidft_env%multiplier_step_max / scal
+                  ENDIF
+               ENDIF
+            ENDIF
+            DO stateJ = 1, npairs
+               ! history for the next update (current gauge)
+               tidft_env%mult_mu_prev(stateJ) = muused_vec(stateJ)
+               tidft_env%mult_g_prev(stateJ) = gcur_vec(stateJ)
+               tidft_env%overlap_multipliers(stateJ) = muused_vec(stateJ) + dmu_vec(stateJ)
+               IF (tidft_env%mult_step_kind(stateJ) .GT. 0 .AND. unit_nr > 0) THEN
+                  kind_str = "boost "
+                  IF (tidft_env%mult_step_kind(stateJ) .EQ. 2) kind_str = "newton"
+                  step_factor = 0.0_dp
+                  IF (ABS(dfo_vec(stateJ)) .GT. 0.0_dp) step_factor = dmu_vec(stateJ) / dfo_vec(stateJ)
+                  WRITE (unit_nr, '(T2,A,A6,A,I5,A,ES12.4,A,ES11.3,A,ES12.4)') &
+                     "ACCELERATED DUAL STEP (", kind_str, ") J =", stateJ, &
+                     "  g_IJ =", gcur_vec(stateJ), "  factor =", step_factor, "  dmu =", dmu_vec(stateJ)
+               ENDIF
+            ENDDO
+            ! safeguard: after an accelerated step the residual may legitimately
+            ! grow (overshoot of the multipliers), so the penalty strength is then
+            ! raised only if the overlaps responded with the wrong sign; otherwise
+            ! it is raised if the residual failed to decrease by the safeguard ratio
+            IF (accel_prev) THEN
+               IF (slope_bad) THEN
+                  tidft_env%interstate_nonorthogonality_penalty_coeff = &
+                     tidft_env%interstate_nonorthogonality_penalty_coeff * &
+                     ABS(tidft_env%penalty_strength_inc_factor)
+                  ! restart the Jacobian model with the new penalty strength
+                  hinv_set = .FALSE.
+                  nhist = 0
+                  IF (unit_nr > 0) WRITE (unit_nr, '(T2,A)') &
+                     "SAFEGUARD: wrong-sign dual response, interstate penalty strength increased"
+               ENDIF
+            ELSE IF (residual_prev .GE. 0.0_dp .AND. &
+                     residual .GT. tidft_env%multiplier_safeguard_ratio * residual_prev) THEN
                tidft_env%interstate_nonorthogonality_penalty_coeff = &
                   tidft_env%interstate_nonorthogonality_penalty_coeff * &
                   ABS(tidft_env%penalty_strength_inc_factor)
@@ -686,6 +923,8 @@ CONTAINS
       ENDIF
 
       tidft_env%tidft_optimizer_pcg%eps_error = save_eps_scf
+      DEALLOCATE(dm_hist, dg_hist, rmat, gram, dfo_vec, dmu_vec, gcur_vec, muused_vec, dg_vec, &
+                 dmuh_vec, eta_vec, h0diag, coef, corr_vec, active, accel_now, umask)
 
    END SUBROUTINE penalty_strength_variation
 
@@ -765,6 +1004,118 @@ CONTAINS
       tidft_env%gauge_ref_set = .TRUE.
 
    END SUBROUTINE multiplier_gauge_sign
+
+! **************************************************************************************************
+!> \brief Smallest principal cosine between the occupied subspaces of two states over the spin
+!>        channels of the determinant used by the interstate term
+!> \param tidft_env ...
+!> \param stateI ...
+!> \param stateJ ...
+!> \param cmin ...
+! **************************************************************************************************
+   SUBROUTINE smallest_principal_cosine(tidft_env, stateI, stateJ, cmin)
+
+      TYPE(tidft_env_type), INTENT(INOUT)                :: tidft_env
+      INTEGER, INTENT(IN)                                :: stateI, stateJ
+      REAL(KIND=dp), INTENT(OUT)                         :: cmin
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'smallest_principal_cosine', &
+         routineP = moduleN//':'//routineN
+
+      INTEGER                                            :: idet, ispin
+      REAL(KIND=dp), DIMENSION(1)                        :: cosines
+
+      cmin = 1.0_dp
+      idet = 1
+      IF (tidft_env%triplet_correction) idet = 2
+      DO ispin = 1, tidft_env%nspins
+         CALL principal_cosines(tidft_env, stateI, stateJ, idet, ispin, cosines)
+         cmin = MIN(cmin, cosines(1))
+      ENDDO
+
+   END SUBROUTINE smallest_principal_cosine
+
+! **************************************************************************************************
+!> \brief Smallest principal cosines between the occupied subspaces of states I and J for one
+!>        spin channel: square roots of the smallest eigenvalues of the generalized problem
+!>        sigma_IJ sigma_JJ^-1 sigma_JI w = lambda sigma_II w, solved with LAPACK on replicated
+!>        copies of the small occupied-orbital overlap matrices (invariant to the normalization
+!>        of the orbitals of either state).
+!> \param tidft_env ...
+!> \param stateI ...
+!> \param stateJ - must be smaller than stateI (the interstate overlap is stored as sigma_JI)
+!> \param idet ...
+!> \param ispin ...
+!> \param cosines - the SIZE(cosines) smallest cosines in increasing order (padded with 1)
+! **************************************************************************************************
+   SUBROUTINE principal_cosines(tidft_env, stateI, stateJ, idet, ispin, cosines)
+
+      TYPE(tidft_env_type), INTENT(INOUT)                :: tidft_env
+      INTEGER, INTENT(IN)                                :: stateI, stateJ, idet, ispin
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: cosines
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'principal_cosines', &
+         routineP = moduleN//':'//routineN
+
+      INTEGER                                            :: nI, nJ, info, lwork, k
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:,:)         :: sII, sJJ, sIJ, b, x
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eig, work
+      TYPE(cp_fm_type)                                   :: fm
+      TYPE(cp_fm_struct_type), POINTER                   :: fm_struct
+
+      cosines(:) = 1.0_dp
+      nI = tidft_env%e_states(stateI)%slater_det(idet)%nelectrons_ab(ispin)
+      nJ = tidft_env%e_states(stateJ)%slater_det(idet)%nelectrons_ab(ispin)
+      IF (nI .LE. 0 .OR. nJ .LE. 0) RETURN
+      ALLOCATE(sII(nI,nI), sJJ(nJ,nJ), sIJ(nI,nJ), b(nI,nI), x(nJ,nI), eig(nI))
+
+      ! replicated copies of the small overlap matrices
+      NULLIFY(fm_struct)
+      CALL cp_fm_struct_create(fm_struct, context=tidft_env%blacs_env, nrow_global=nI, &
+                               ncol_global=nI, para_env=tidft_env%para_env)
+      CALL cp_fm_create(fm, fm_struct)
+      CALL copy_dbcsr_to_fm(tidft_env%mat_sigma(stateI,stateI,idet,ispin), fm)
+      CALL cp_fm_get_submatrix(fm, sII)
+      CALL cp_fm_release(fm)
+      CALL cp_fm_struct_release(fm_struct)
+      CALL cp_fm_struct_create(fm_struct, context=tidft_env%blacs_env, nrow_global=nJ, &
+                               ncol_global=nJ, para_env=tidft_env%para_env)
+      CALL cp_fm_create(fm, fm_struct)
+      CALL copy_dbcsr_to_fm(tidft_env%mat_sigma(stateJ,stateJ,idet,ispin), fm)
+      CALL cp_fm_get_submatrix(fm, sJJ)
+      CALL cp_fm_release(fm)
+      CALL cp_fm_struct_release(fm_struct)
+      ! the interstate MO overlap is stored for stateJ < stateI as sigma_JI (nJ x nI)
+      CALL cp_fm_struct_create(fm_struct, context=tidft_env%blacs_env, nrow_global=nJ, &
+                               ncol_global=nI, para_env=tidft_env%para_env)
+      CALL cp_fm_create(fm, fm_struct)
+      CALL copy_dbcsr_to_fm(tidft_env%mat_sigma(stateJ,stateI,idet,ispin), fm)
+      CALL cp_fm_get_submatrix(fm, x)
+      CALL cp_fm_release(fm)
+      CALL cp_fm_struct_release(fm_struct)
+      sIJ = TRANSPOSE(x)
+
+      ! x <- sigma_JJ^-1 sigma_JI (Cholesky solve), b = sigma_IJ sigma_JJ^-1 sigma_JI
+      CALL dpotrf('U', nJ, sJJ, nJ, info)
+      IF (info .EQ. 0) CALL dpotrs('U', nJ, nI, sJJ, nJ, x, nJ, info)
+      IF (info .NE. 0) THEN
+         DEALLOCATE(sII, sJJ, sIJ, b, x, eig)
+         RETURN
+      ENDIF
+      b = MATMUL(sIJ, x)
+      b = 0.5_dp*(b + TRANSPOSE(b))
+      ! generalized symmetric-definite eigenproblem b w = lambda sigma_II w, ascending eigenvalues
+      lwork = 10*nI + 64
+      ALLOCATE(work(lwork))
+      CALL dsygv(1, 'N', 'U', nI, b, nI, sII, nI, eig, work, lwork, info)
+      IF (info .EQ. 0) THEN
+         DO k = 1, MIN(SIZE(cosines), nI)
+            cosines(k) = SQRT(MAX(eig(k), 0.0_dp))
+         ENDDO
+      ENDIF
+      DEALLOCATE(sII, sJJ, sIJ, b, x, eig, work)
+
+   END SUBROUTINE principal_cosines
 
 ! **************************************************************************************************
 !> \brief Optimization of MOs using PCG minimizers
@@ -1954,6 +2305,7 @@ CONTAINS
                       SQRT(tidft_env%mat_phi(nstates, nstates) * tidft_env%mat_phi(stateJ, stateJ))
                multiplier_term = multiplier_term + tidft_env%overlap_multipliers(stateJ) * g_IJ
                tidft_env%multiplier_residual = MAX(tidft_env%multiplier_residual, ABS(g_IJ))
+               IF (ALLOCATED(tidft_env%mult_g_cur)) tidft_env%mult_g_cur(stateJ) = g_IJ
             ENDDO
             tidft_env%schur_constraint = LOG(tidft_env%mat_phi(nstates, nstates) * &
                                              tidft_env%mat_phi_inv(nstates, nstates))

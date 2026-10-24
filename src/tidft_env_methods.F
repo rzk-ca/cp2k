@@ -302,6 +302,40 @@ CONTAINS
       CALL section_vals_val_get(penalty_section, &
                                 "MULTIPLIER_MAX_ITER", &
                                 i_val=tidft_env%multiplier_max_iter)
+      ! accelerated dual update
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_ACCELERATION", &
+                                l_val=tidft_env%multiplier_acceleration)
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_ACCEL_SINGLE_PAIR", &
+                                l_val=tidft_env%multiplier_accel_single_pair)
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_CURVATURE_GUESS", &
+                                r_val=tidft_env%multiplier_curvature_guess)
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_BOOST_MAX", &
+                                r_val=tidft_env%multiplier_boost_max)
+      tidft_env%multiplier_boost_max = MAX(1.0_dp, ABS(tidft_env%multiplier_boost_max))
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_BOOST_MIN", &
+                                r_val=tidft_env%multiplier_boost_min)
+      tidft_env%multiplier_boost_min = MAX(1.0_dp, ABS(tidft_env%multiplier_boost_min))
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_BOOST_DAMPING", &
+                                r_val=tidft_env%multiplier_boost_damping)
+      tidft_env%multiplier_boost_damping = MIN(1.0_dp, ABS(tidft_env%multiplier_boost_damping))
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_SECANT_NOISE", &
+                                r_val=tidft_env%multiplier_secant_noise)
+      tidft_env%multiplier_secant_noise = ABS(tidft_env%multiplier_secant_noise)
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_STEP_MAX", &
+                                r_val=tidft_env%multiplier_step_max)
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_SECANT_DEPTH", &
+                                i_val=tidft_env%multiplier_secant_depth)
+      tidft_env%multiplier_secant_depth = MAX(1, tidft_env%multiplier_secant_depth)
+      tidft_env%multiplier_step_max = ABS(tidft_env%multiplier_step_max)
 
       ! CINDY: Pass input from WF_GUESS section
       WF_guess_section => section_vals_get_subs_vals(tidft_section, "WF_GUESS")
@@ -454,6 +488,12 @@ CONTAINS
       ! signed-overlap multipliers (one per state, used for states J < current I)
       ALLOCATE(tidft_env%overlap_multipliers(nstates))
       tidft_env%overlap_multipliers(:) = 0.0_dp
+      ALLOCATE(tidft_env%mult_g_cur(nstates), tidft_env%mult_g_prev(nstates), &
+               tidft_env%mult_mu_prev(nstates), tidft_env%mult_step_kind(nstates))
+      tidft_env%mult_g_cur(:) = 0.0_dp
+      tidft_env%mult_g_prev(:) = 0.0_dp
+      tidft_env%mult_mu_prev(:) = 0.0_dp
+      tidft_env%mult_step_kind(:) = 0
       tidft_env%multiplier_residual = 0.0_dp
       tidft_env%schur_constraint = 0.0_dp
       tidft_env%gauge_ref_set = .FALSE.
@@ -861,6 +901,10 @@ CONTAINS
       DEALLOCATE(tidft_env%mat_phi_inv)
       DEALLOCATE(tidft_env%mat_phi)
       IF (ALLOCATED(tidft_env%overlap_multipliers)) DEALLOCATE(tidft_env%overlap_multipliers)
+      IF (ALLOCATED(tidft_env%mult_g_cur)) DEALLOCATE(tidft_env%mult_g_cur)
+      IF (ALLOCATED(tidft_env%mult_g_prev)) DEALLOCATE(tidft_env%mult_g_prev)
+      IF (ALLOCATED(tidft_env%mult_mu_prev)) DEALLOCATE(tidft_env%mult_mu_prev)
+      IF (ALLOCATED(tidft_env%mult_step_kind)) DEALLOCATE(tidft_env%mult_step_kind)
       DEALLOCATE(tidft_env%mat_phi_spin)
       DEALLOCATE(tidft_env%e_states)
       DEALLOCATE(tidft_env%omega_intra)
@@ -1082,6 +1126,10 @@ CONTAINS
       DEALLOCATE(tidft_env%mat_phi_inv)
       DEALLOCATE(tidft_env%mat_phi)
       IF (ALLOCATED(tidft_env%overlap_multipliers)) DEALLOCATE(tidft_env%overlap_multipliers)
+      IF (ALLOCATED(tidft_env%mult_g_cur)) DEALLOCATE(tidft_env%mult_g_cur)
+      IF (ALLOCATED(tidft_env%mult_g_prev)) DEALLOCATE(tidft_env%mult_g_prev)
+      IF (ALLOCATED(tidft_env%mult_mu_prev)) DEALLOCATE(tidft_env%mult_mu_prev)
+      IF (ALLOCATED(tidft_env%mult_step_kind)) DEALLOCATE(tidft_env%mult_step_kind)
       DEALLOCATE(tidft_env%mat_phi_spin)
       DEALLOCATE(tidft_env%e_states)
 

@@ -594,6 +594,102 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_ACCELERATION", &
+                          description="Used with MULTIPLIER_COMPONENT. Quasi-Newton dual update for the "// &
+                          "pairs of states whose overlap is above the orthogonality threshold. The first "// &
+                          "multiplier step is over-relaxed by 1 + MULTIPLIER_CURVATURE_GUESS/(2*lambda*P^2), "// &
+                          "where P is the product of all principal cosines of the pair but the smallest; "// &
+                          "later steps use an approximate inverse Jacobian of the overlaps with respect to "// &
+                          "the multipliers that is corrected (Broyden rank-one update) with the observed "// &
+                          "response to each multiplier change, which also captures the coupling between "// &
+                          "pairs. After an accelerated step the penalty strength is raised only if the "// &
+                          "overlaps responded with the wrong sign.", &
+                          usage="MULTIPLIER_ACCELERATION .TRUE.", default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_ACCEL_SINGLE_PAIR", &
+                          description="Used with MULTIPLIER_ACCELERATION. Accelerate only one pair per "// &
+                          "outer iteration: the previously accelerated pair while its overlap is above "// &
+                          "the threshold, otherwise the pair with the largest overlap. The other pairs "// &
+                          "take first-order steps, which are close to exact for them, and the inverse "// &
+                          "Jacobian is corrected only with the response of the accelerated pair, because "// &
+                          "the responses of the other pairs are dominated by their own steps and by the "// &
+                          "coupling. FALSE accelerates all pairs above the threshold at once with a full "// &
+                          "rank-one update.", &
+                          usage="MULTIPLIER_ACCEL_SINGLE_PAIR .TRUE.", default_l_val=.TRUE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_CURVATURE_GUESS", &
+                          description="Used with MULTIPLIER_ACCELERATION. Guess (Hartree) of the curvature "// &
+                          "of the energy along the smallest principal cosine of a pair of states, used by "// &
+                          "the over-relaxed first multiplier step.", &
+                          usage="MULTIPLIER_CURVATURE_GUESS 1.0", &
+                          default_r_val=1.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_BOOST_MAX", &
+                          description="Used with MULTIPLIER_ACCELERATION. Largest over-relaxation factor "// &
+                          "of the first accelerated multiplier step.", &
+                          usage="MULTIPLIER_BOOST_MAX 100.0", &
+                          default_r_val=100.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_BOOST_MIN", &
+                          description="Used with MULTIPLIER_ACCELERATION. The first multiplier step of a "// &
+                          "pair is over-relaxed only if the model factor 1 + MULTIPLIER_CURVATURE_GUESS/"// &
+                          "(2*lambda*P^2) is at least this value, i.e. only for pairs with a small second "// &
+                          "principal cosine; for the other pairs the plain first-order step is already "// &
+                          "close to exact and the curvature guess does not apply.", &
+                          usage="MULTIPLIER_BOOST_MIN 2.0", &
+                          default_r_val=2.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_BOOST_DAMPING", &
+                          description="Used with MULTIPLIER_ACCELERATION. The over-relaxation of the first "// &
+                          "multiplier step is damped to 1 + damping*(factor - 1): the curvature guess is "// &
+                          "uncertain, an undershoot is completed by the following quasi-Newton step whereas "// &
+                          "an overshoot perturbs the state.", &
+                          usage="MULTIPLIER_BOOST_DAMPING 0.5", &
+                          default_r_val=0.5_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_SECANT_NOISE", &
+                          description="Used with MULTIPLIER_ACCELERATION. Smallest relative change of the "// &
+                          "overlaps between two outer iterations (norm over the pairs) that is taken as a "// &
+                          "genuine response to the multiplier change and used to correct the inverse "// &
+                          "Jacobian; smaller changes are attributed to the noise of the inexact inner "// &
+                          "optimization.", &
+                          usage="MULTIPLIER_SECANT_NOISE 0.05", &
+                          default_r_val=0.05_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_SECANT_DEPTH", &
+                          description="Used with MULTIPLIER_ACCELERATION. Number of previous outer "// &
+                          "iterations whose multiplier changes and overlap responses are fitted at once "// &
+                          "(multisecant correction of the model inverse Jacobian). One gives the rank-one "// &
+                          "Broyden update; n resolves the coupling among n pairs after n updates.", &
+                          usage="MULTIPLIER_SECANT_DEPTH 1", &
+                          default_i_val=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_STEP_MAX", &
+                          description="Used with MULTIPLIER_ACCELERATION. Largest change (Hartree) of a "// &
+                          "multiplier in one accelerated step.", &
+                          usage="MULTIPLIER_STEP_MAX 1.0", &
+                          default_r_val=1.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
    END SUBROUTINE create_penalty_section
 
 ! **************************************************************************************************
