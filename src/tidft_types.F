@@ -26,6 +26,11 @@ MODULE tidft_types
 
    PUBLIC :: tidft_env_type, tidft_env_release
 
+   ! constraint function of the multiplier term for a pair of states
+   INTEGER, PARAMETER, PUBLIC :: tidft_mult_determinant = 1, &
+                                 tidft_mult_spin_channel = 2, &
+                                 tidft_mult_orbital_pair = 3
+
    ! Note that closed-shell DFT (RKS) is not explicitly considered here
    ! because excitations unpair electrons. In the (rare) cases of
    ! excitations of paired electrons, use ROKS with max unpairings set to 0
@@ -203,6 +208,27 @@ MODULE tidft_types
       ! -ln(1 - s^T A^-1 s) = ln(Phi_II * (Phi^-1)_II)
       REAL(KIND=dp)                                      :: multiplier_residual
       REAL(KIND=dp)                                      :: schur_constraint
+      ! diagnostics of the pair with the largest |g_IJ|: index J and the normalized
+      ! spin-resolved overlaps Phi~^alpha_IJ, Phi~^beta_IJ
+      INTEGER                                            :: residual_pair = 0
+      REAL(KIND=dp), DIMENSION(2)                        :: residual_pair_spin = 0.0_dp
+      ! three smallest principal cosines between the occupied subspaces of the pair
+      ! in the spin channel with the smaller overlap (diagnostics)
+      REAL(KIND=dp), DIMENSION(3)                        :: residual_pair_cos = 0.0_dp
+      ! spin-resolved constraint: the multiplier of pair (I,J) is attached to the
+      ! normalized spin overlap of the channel multiplier_channel(J) (the smaller one,
+      ! chosen at each dual update) instead of to the product of the two spin overlaps
+      LOGICAL                                            :: multiplier_spin_resolved = .FALSE.
+      INTEGER, DIMENSION(:), ALLOCATABLE                 :: multiplier_channel
+      ! which constraint function the multipliers act on (tidft_mult_* above)
+      INTEGER                                            :: multiplier_constraint = 3
+      ! orbital-pair constraint: for each previous state J the reference orbital of the
+      ! current state (pair_u, coefficients in its occupied basis of the selected spin
+      ! channel) and its partner in J (pair_v), the fixed norm r_J = v^T sigma_JJ v, the
+      ! conversion factor P_J = g_IJ/c_IJ at the last update, and the current c_J and
+      ! q_J = u^T sigma_II u evaluated with the loss functional
+      REAL(KIND=dp), DIMENSION(:,:), ALLOCATABLE         :: pair_u, pair_v
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: pair_r, pair_P, pair_c, pair_q
       ! reference copy of the current state's MOs (one per spin) taken at the
       ! last dual update; used to detect a sign (gauge) flip of the orbitals
       TYPE(dbcsr_type), DIMENSION(:), ALLOCATABLE        :: mat_t_gauge_ref

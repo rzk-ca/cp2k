@@ -15,7 +15,11 @@ MODULE tidft_env_methods
    USE almo_scf_types,                  ONLY: almo_mat_dim_aobasis,&
                                               almo_mat_dim_occ, &
                                               almo_mat_dim_virt
-   USE tidft_types,                     ONLY: tidft_env_type
+   USE tidft_types,                     ONLY: tidft_env_type,&
+                                              tidft_mult_determinant,&
+                                              tidft_mult_spin_channel,&
+                                              tidft_mult_orbital_pair
+   USE string_utilities,                ONLY: uppercase
    USE tidft_qs,                        ONLY: matrix_layout,&
                                               tidft_init_ks_matrices
    USE cp_dbcsr_cholesky,               ONLY: cp_dbcsr_cholesky_decompose,&
@@ -119,6 +123,7 @@ CONTAINS
                                                             jj, GS_multips, nmultips 
       INTEGER, DIMENSION(:), POINTER                     :: tmplist
       INTEGER, DIMENSION(:), ALLOCATABLE                 :: nstates
+      CHARACTER(LEN=80)                                  :: constraint_name
       LOGICAL                                            :: explicit
       TYPE(section_vals_type), POINTER                   :: tidft_pcg_optimizer_section, &
                                                             tidft_section, &
@@ -185,6 +190,22 @@ CONTAINS
       IF (tidft_env%multiplier_component .AND. .NOT. tidft_env%state_by_state) THEN
          CPABORT("MULTIPLIER_COMPONENT requires STATE_BY_STATE=.TRUE.")
       ENDIF
+      CALL section_vals_val_get(tidft_section, &
+              "MULTIPLIER_CONSTRAINT", &
+              c_val=constraint_name)
+      CALL uppercase(constraint_name)
+      SELECT CASE (TRIM(constraint_name))
+      CASE ("DETERMINANT")
+         tidft_env%multiplier_constraint = tidft_mult_determinant
+      CASE ("SPIN_CHANNEL")
+         tidft_env%multiplier_constraint = tidft_mult_spin_channel
+      CASE ("ORBITAL_PAIR")
+         tidft_env%multiplier_constraint = tidft_mult_orbital_pair
+      CASE DEFAULT
+         CPABORT("MULTIPLIER_CONSTRAINT must be DETERMINANT, SPIN_CHANNEL or ORBITAL_PAIR")
+      END SELECT
+      tidft_env%multiplier_spin_resolved = &
+         (tidft_env%multiplier_constraint .EQ. tidft_mult_spin_channel)
       CALL section_vals_val_get(tidft_section, &
               "PRE_ORTHOGONALIZE_STATES", &
               l_val=tidft_env%pre_orthogonalize_states)
@@ -454,6 +475,14 @@ CONTAINS
       ! signed-overlap multipliers (one per state, used for states J < current I)
       ALLOCATE(tidft_env%overlap_multipliers(nstates))
       tidft_env%overlap_multipliers(:) = 0.0_dp
+      ALLOCATE(tidft_env%multiplier_channel(nstates))
+      tidft_env%multiplier_channel(:) = 1
+      ALLOCATE(tidft_env%pair_r(nstates), tidft_env%pair_P(nstates), &
+               tidft_env%pair_c(nstates), tidft_env%pair_q(nstates))
+      tidft_env%pair_r(:) = 0.0_dp
+      tidft_env%pair_P(:) = 0.0_dp
+      tidft_env%pair_c(:) = 0.0_dp
+      tidft_env%pair_q(:) = 1.0_dp
       tidft_env%multiplier_residual = 0.0_dp
       tidft_env%schur_constraint = 0.0_dp
       tidft_env%gauge_ref_set = .FALSE.
@@ -861,6 +890,13 @@ CONTAINS
       DEALLOCATE(tidft_env%mat_phi_inv)
       DEALLOCATE(tidft_env%mat_phi)
       IF (ALLOCATED(tidft_env%overlap_multipliers)) DEALLOCATE(tidft_env%overlap_multipliers)
+      IF (ALLOCATED(tidft_env%multiplier_channel)) DEALLOCATE(tidft_env%multiplier_channel)
+      IF (ALLOCATED(tidft_env%pair_r)) DEALLOCATE(tidft_env%pair_r)
+      IF (ALLOCATED(tidft_env%pair_P)) DEALLOCATE(tidft_env%pair_P)
+      IF (ALLOCATED(tidft_env%pair_c)) DEALLOCATE(tidft_env%pair_c)
+      IF (ALLOCATED(tidft_env%pair_q)) DEALLOCATE(tidft_env%pair_q)
+      IF (ALLOCATED(tidft_env%pair_u)) DEALLOCATE(tidft_env%pair_u)
+      IF (ALLOCATED(tidft_env%pair_v)) DEALLOCATE(tidft_env%pair_v)
       DEALLOCATE(tidft_env%mat_phi_spin)
       DEALLOCATE(tidft_env%e_states)
       DEALLOCATE(tidft_env%omega_intra)
@@ -1082,6 +1118,13 @@ CONTAINS
       DEALLOCATE(tidft_env%mat_phi_inv)
       DEALLOCATE(tidft_env%mat_phi)
       IF (ALLOCATED(tidft_env%overlap_multipliers)) DEALLOCATE(tidft_env%overlap_multipliers)
+      IF (ALLOCATED(tidft_env%multiplier_channel)) DEALLOCATE(tidft_env%multiplier_channel)
+      IF (ALLOCATED(tidft_env%pair_r)) DEALLOCATE(tidft_env%pair_r)
+      IF (ALLOCATED(tidft_env%pair_P)) DEALLOCATE(tidft_env%pair_P)
+      IF (ALLOCATED(tidft_env%pair_c)) DEALLOCATE(tidft_env%pair_c)
+      IF (ALLOCATED(tidft_env%pair_q)) DEALLOCATE(tidft_env%pair_q)
+      IF (ALLOCATED(tidft_env%pair_u)) DEALLOCATE(tidft_env%pair_u)
+      IF (ALLOCATED(tidft_env%pair_v)) DEALLOCATE(tidft_env%pair_v)
       DEALLOCATE(tidft_env%mat_phi_spin)
       DEALLOCATE(tidft_env%e_states)
 

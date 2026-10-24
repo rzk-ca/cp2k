@@ -180,6 +180,19 @@ CONTAINS
                           lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_CONSTRAINT", &
+                          description="Used with MULTIPLIER_COMPONENT. Constraint function of each pair of "// &
+                          "states to which its multiplier is attached. DETERMINANT: the normalized "// &
+                          "determinant overlap of the two states. SPIN_CHANNEL: the normalized determinant "// &
+                          "overlap of the spin channel with the smaller overlap. ORBITAL_PAIR: the cosine "// &
+                          "between the pair of orbitals, one in each state, that is closest to orthogonal "// &
+                          "(the smallest principal cosine between the occupied subspaces), with the pair "// &
+                          "fixed during an inner optimization and re-selected at each multiplier update. "// &
+                          "Convergence is always judged on the state overlap.", &
+                          usage="MULTIPLIER_CONSTRAINT ORBITAL_PAIR", default_c_val="ORBITAL_PAIR")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, name="INTRASTATE_COMPONENT", &
                           description="Turn on the intrastate nonorthogonality peanlty.", &
                           usage="INTRASTATE_COMPONENT .FALSE.", default_l_val=.TRUE., &

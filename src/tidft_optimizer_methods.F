@@ -24,6 +24,16 @@ MODULE tidft_optimizer_methods
                                               cp_dbcsr_adjugate
    USE cp_dbcsr_cholesky,               ONLY: cp_dbcsr_cholesky_decompose,&
                                               cp_dbcsr_cholesky_invert
+   USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
+                                              copy_fm_to_dbcsr
+   USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
+                                              cp_fm_struct_release,&
+                                              cp_fm_struct_type
+   USE cp_fm_types,                     ONLY: cp_fm_create,&
+                                              cp_fm_get_submatrix,&
+                                              cp_fm_set_submatrix,&
+                                              cp_fm_release,&
+                                              cp_fm_type
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
                                               cp_logger_get_default_unit_nr,&
                                               cp_logger_type
@@ -52,7 +62,10 @@ MODULE tidft_optimizer_methods
    USE qs_energy_types,                 ONLY: qs_energy_type
    USE qs_rho_types,                    ONLY: qs_rho_get,&
                                               qs_rho_type
-   USE tidft_types,                     ONLY: tidft_env_type
+   USE tidft_types,                     ONLY: tidft_mult_determinant,&
+                                              tidft_mult_spin_channel,&
+                                              tidft_mult_orbital_pair,&
+                                              tidft_env_type
    USE tidft_optimizer_types,           ONLY: tidft_optimizer_storage_type
    USE tidft_methods,                   ONLY: tidft_optimizer_mainvar_dot, &
                                               tidft_optimizer_mainvar_add, &
@@ -284,7 +297,11 @@ CONTAINS
       INTEGER                                            :: stateJ, cur_state, ispin, &
                                                             idet, nmos
       REAL(KIND=dp)                                      :: residual, residual_prev, &
-                                                            gauge_sign, lambda_dual
+                                                            gauge_sign, lambda_dual, mu_old
+      REAL(KIND=dp), DIMENSION(2)                        :: gauge_sign_spin, phis
+      INTEGER                                            :: ichan_old, ichan_new, nmax_pair
+      REAL(KIND=dp)                                      :: cmin, pother, p_new, mu_g, g_pair
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: uvec, vvec
       ! aeph: the det(phi) threshold is read from input (tidft_env%eps_det, default 1.0E-10)
       !REAL(KIND=dp), PARAMETER                           :: tau_c  ! aeph: ALM decrease ratio for mu in tidft_env%alm_decrease_ratio
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -331,7 +348,29 @@ CONTAINS
       residual_prev = -1.0_dp
       gauge_sign = 1.0_dp
       tidft_env%overlap_multipliers(:) = 0.0_dp
+      tidft_env%multiplier_channel(:) = 1
       tidft_env%gauge_ref_set = .FALSE.
+      ! orbital-pair constraint: reference orbitals of all pairs, reset for every state
+      tidft_env%pair_r(:) = 0.0_dp
+      tidft_env%pair_P(:) = 0.0_dp
+      tidft_env%pair_c(:) = 0.0_dp
+      tidft_env%pair_q(:) = 1.0_dp
+      IF (mult_on .AND. tidft_env%multiplier_constraint .EQ. tidft_mult_orbital_pair) THEN
+         idet = 1
+         IF (tidft_env%triplet_correction) idet = 2
+         nmax_pair = 1
+         DO stateJ = 1, cur_state
+            DO ispin = 1, tidft_env%nspins
+               nmax_pair = MAX(nmax_pair, tidft_env%e_states(stateJ)%slater_det(idet)%nelectrons_ab(ispin))
+            ENDDO
+         ENDDO
+         IF (ALLOCATED(tidft_env%pair_u)) DEALLOCATE(tidft_env%pair_u)
+         IF (ALLOCATED(tidft_env%pair_v)) DEALLOCATE(tidft_env%pair_v)
+         ALLOCATE(tidft_env%pair_u(nmax_pair, cur_state), tidft_env%pair_v(nmax_pair, cur_state))
+         tidft_env%pair_u(:,:) = 0.0_dp
+         tidft_env%pair_v(:,:) = 0.0_dp
+         ALLOCATE(uvec(nmax_pair), vvec(nmax_pair))
+      ENDIF
       ! aeph: we reset mu to the input value at each penalty-strength pass (per state)
       IF (tidft_env%loss_function_components(4) .AND. &
          tidft_env%loss_function_components(3)) THEN
@@ -378,8 +417,17 @@ CONTAINS
                tidft_env%interstate_nonorthogonality_penalty_coeff
             IF (mult_on) THEN
                DO stateJ = 1, cur_state - 1
-                  WRITE (unit_nr, '(T2,A49,I6,F24.10)') "State and its overlap multiplier:", stateJ, &
-                     tidft_env%overlap_multipliers(stateJ)
+                  IF (tidft_env%multiplier_constraint .EQ. tidft_mult_orbital_pair) THEN
+                     WRITE (unit_nr, '(T2,A49,I6,F24.10,A8,I2,A4,ES12.4)') "State and its overlap multiplier:", stateJ, &
+                        tidft_env%overlap_multipliers(stateJ), "  spin", tidft_env%multiplier_channel(stateJ), &
+                        " c=", tidft_env%pair_c(stateJ)
+                  ELSE IF (tidft_env%multiplier_spin_resolved) THEN
+                     WRITE (unit_nr, '(T2,A49,I6,F24.10,A8,I2)') "State and its overlap multiplier:", stateJ, &
+                        tidft_env%overlap_multipliers(stateJ), "  spin", tidft_env%multiplier_channel(stateJ)
+                  ELSE
+                     WRITE (unit_nr, '(T2,A49,I6,F24.10)') "State and its overlap multiplier:", stateJ, &
+                        tidft_env%overlap_multipliers(stateJ)
+                  ENDIF
                ENDDO
             ENDIF
             IF (tidft_env%loss_function_components(4) .AND. &
@@ -439,6 +487,11 @@ CONTAINS
                ! -ln det(Phi) that belongs to the current state
                WRITE (unit_nr, '(T2,A19,ES30.6,ES30.6)') "ROW-RESIDUAL, C_I:", &
                   tidft_env%multiplier_residual, tidft_env%schur_constraint
+               WRITE (unit_nr, '(T2,A,I5,A,ES14.6,A,ES14.6)') "RESIDUAL-PAIR J =", &
+                  tidft_env%residual_pair, "  Phi~alpha_IJ =", tidft_env%residual_pair_spin(1), &
+                  "  Phi~beta_IJ =", tidft_env%residual_pair_spin(2)
+               WRITE (unit_nr, '(T2,A,3ES14.6)') "RESIDUAL-PAIR smallest principal cosines:", &
+                  tidft_env%residual_pair_cos(1:3)
             ENDIF
             IF (tidft_env%loss_function_components(4) .AND. &
                tidft_env%loss_function_components(3)) THEN
@@ -562,8 +615,9 @@ CONTAINS
          IF (mult_on) THEN
             ! gauge-sign guard: flip the multipliers if the orbitals of the
             ! current state changed sign since the last dual update
-            CALL multiplier_gauge_sign(tidft_env, gauge_sign)
-            IF (gauge_sign .LT. 0.0_dp .AND. unit_nr > 0) THEN
+            CALL multiplier_gauge_sign(tidft_env, gauge_sign_spin)
+            gauge_sign = gauge_sign_spin(1) * gauge_sign_spin(2)
+            IF ((gauge_sign_spin(1) .LT. 0.0_dp .OR. gauge_sign_spin(2) .LT. 0.0_dp) .AND. unit_nr > 0) THEN
                WRITE (unit_nr, '(T2,A)') &
                   "WARNING: sign flip of the current-state orbitals detected, multipliers flipped"
             ENDIF
@@ -576,12 +630,88 @@ CONTAINS
                           tidft_env%multiplier_curvature_shift
             IF (lambda_dual .LE. 0.0_dp) &
                lambda_dual = tidft_env%interstate_nonorthogonality_penalty_coeff
+            idet = 1
+            IF (tidft_env%triplet_correction) idet = 2
             DO stateJ = 1, cur_state - 1
-               tidft_env%overlap_multipliers(stateJ) = &
-                  gauge_sign * tidft_env%overlap_multipliers(stateJ) - &
-                  2.0_dp * lambda_dual * &
-                  SQRT(tidft_env%mat_phi(cur_state,cur_state) * tidft_env%mat_phi(stateJ,stateJ)) * &
-                  tidft_env%mat_phi_inv(stateJ,cur_state)
+               IF (tidft_env%multiplier_constraint .EQ. tidft_mult_orbital_pair) THEN
+                  ! normalized spin overlaps and the signed state overlap of the pair
+                  DO ispin = 1, tidft_env%nspins
+                     phis(ispin) = tidft_env%mat_phi_spin(cur_state,stateJ,ispin) / &
+                        SQRT(tidft_env%mat_phi_spin(cur_state,cur_state,ispin) * &
+                             tidft_env%mat_phi_spin(stateJ,stateJ,ispin))
+                  ENDDO
+                  g_pair = tidft_env%mat_phi(cur_state,stateJ) / &
+                     SQRT(tidft_env%mat_phi(cur_state,cur_state) * tidft_env%mat_phi(stateJ,stateJ))
+                  ! channel with the smaller overlap, and in it the orbital pair closest
+                  ! to orthogonal (smallest principal cosine) as the new reference pair
+                  ichan_new = 1
+                  IF (ABS(phis(2)) .LT. ABS(phis(1))) ichan_new = 2
+                  CALL orbital_pair_select(tidft_env, cur_state, stateJ, idet, ichan_new, &
+                                           uvec, vvec, cmin, pother)
+                  ! P = g/c: signed product of the other cosines and of the other spin overlap
+                  IF (cmin .GT. 1.0E-12_dp) THEN
+                     p_new = g_pair / cmin
+                  ELSE
+                     p_new = SIGN(pother * ABS(phis(3 - ichan_new)), g_pair)
+                  ENDIF
+                  ! effective multiplier with respect to the state overlap: the current
+                  ! multiplier term (converted with the previous P, in the current gauge)
+                  ! plus the penalty
+                  mu_g = 0.0_dp
+                  IF (ABS(tidft_env%pair_P(stateJ)) .GT. 0.0_dp) &
+                     mu_g = gauge_sign * tidft_env%overlap_multipliers(stateJ) / tidft_env%pair_P(stateJ)
+                  mu_g = mu_g - 2.0_dp * lambda_dual * &
+                     SQRT(tidft_env%mat_phi(cur_state,cur_state) * tidft_env%mat_phi(stateJ,stateJ)) * &
+                     tidft_env%mat_phi_inv(stateJ,cur_state)
+                  tidft_env%overlap_multipliers(stateJ) = p_new * mu_g
+                  tidft_env%pair_P(stateJ) = p_new
+                  tidft_env%multiplier_channel(stateJ) = ichan_new
+                  tidft_env%pair_u(:,stateJ) = 0.0_dp
+                  tidft_env%pair_v(:,stateJ) = 0.0_dp
+                  tidft_env%pair_u(1:tidft_env%e_states(cur_state)%slater_det(idet)%nelectrons_ab(ichan_new),stateJ) = &
+                     uvec(1:tidft_env%e_states(cur_state)%slater_det(idet)%nelectrons_ab(ichan_new))
+                  tidft_env%pair_v(1:tidft_env%e_states(stateJ)%slater_det(idet)%nelectrons_ab(ichan_new),stateJ) = &
+                     vvec(1:tidft_env%e_states(stateJ)%slater_det(idet)%nelectrons_ab(ichan_new))
+                  ! r_J = v^T sigma_JJ v is fixed by the normalization of the selection (=cmin^2)
+                  tidft_env%pair_r(stateJ) = MAX(cmin**2, 1.0E-30_dp)
+               ELSE IF (tidft_env%multiplier_spin_resolved) THEN
+                  ! normalized spin overlaps of the pair
+                  DO ispin = 1, tidft_env%nspins
+                     phis(ispin) = tidft_env%mat_phi_spin(cur_state,stateJ,ispin) / &
+                        SQRT(tidft_env%mat_phi_spin(cur_state,cur_state,ispin) * &
+                             tidft_env%mat_phi_spin(stateJ,stateJ,ispin))
+                  ENDDO
+                  ! the multiplier is attached to the smaller spin overlap; the
+                  ! channel is re-selected here and kept during the next inner optimization
+                  ichan_old = tidft_env%multiplier_channel(stateJ)
+                  ichan_new = 1
+                  IF (ABS(phis(2)) .LT. ABS(phis(1))) ichan_new = 2
+                  ! gauge sign of the channel the old multiplier was attached to
+                  mu_old = gauge_sign_spin(ichan_old) * tidft_env%overlap_multipliers(stateJ)
+                  ! convert the old multiplier to the new channel:
+                  !   mu*c_old = mu*g/Phi~(other_old) = [mu*Phi~(other_new)/Phi~(other_old)]*c_new
+                  IF (ichan_new .NE. ichan_old) THEN
+                     IF (ABS(phis(3 - ichan_old)) .GT. 1.0E-10_dp) THEN
+                        mu_old = mu_old * phis(3 - ichan_new) / phis(3 - ichan_old)
+                     ELSE
+                        mu_old = 0.0_dp
+                     ENDIF
+                  ENDIF
+                  ! dual step: the effective multiplier carried by the penalty with respect
+                  ! to the product is -2*lambda*(Phi~^-1)_JI; with respect to the channel
+                  ! overlap it is that value times the other spin overlap
+                  tidft_env%overlap_multipliers(stateJ) = mu_old - &
+                     2.0_dp * lambda_dual * &
+                     SQRT(tidft_env%mat_phi(cur_state,cur_state) * tidft_env%mat_phi(stateJ,stateJ)) * &
+                     tidft_env%mat_phi_inv(stateJ,cur_state) * phis(3 - ichan_new)
+                  tidft_env%multiplier_channel(stateJ) = ichan_new
+               ELSE
+                  tidft_env%overlap_multipliers(stateJ) = &
+                     gauge_sign * tidft_env%overlap_multipliers(stateJ) - &
+                     2.0_dp * lambda_dual * &
+                     SQRT(tidft_env%mat_phi(cur_state,cur_state) * tidft_env%mat_phi(stateJ,stateJ)) * &
+                     tidft_env%mat_phi_inv(stateJ,cur_state)
+               ENDIF
             ENDDO
             ! safeguard: grow lambda only if the residual failed to decrease
             IF (residual_prev .GE. 0.0_dp .AND. &
@@ -659,8 +789,13 @@ CONTAINS
          IF (mult_on) THEN
             print_string = "State and final overlap multiplier:"
             DO stateJ = 1, cur_state - 1
-               WRITE (unit_nr, '(T2,A54,I5,F20.10)') print_string, stateJ, &
-                  tidft_env%overlap_multipliers(stateJ)
+               IF (tidft_env%multiplier_spin_resolved) THEN
+                  WRITE (unit_nr, '(T2,A54,I5,F20.10,A6,I2)') print_string, stateJ, &
+                     tidft_env%overlap_multipliers(stateJ), " spin", tidft_env%multiplier_channel(stateJ)
+               ELSE
+                  WRITE (unit_nr, '(T2,A54,I5,F20.10)') print_string, stateJ, &
+                     tidft_env%overlap_multipliers(stateJ)
+               ENDIF
             ENDDO
             print_string = "Final current-row residual max|g_IJ|:"
             WRITE (unit_nr, '(T2,A59,ES20.6)') &
@@ -670,6 +805,10 @@ CONTAINS
          WRITE (unit_nr, '(T2,A)') REPEAT("-", 79)
 
       ENDIF
+
+      IF (ALLOCATED(uvec)) DEALLOCATE(uvec, vvec)
+      IF (ALLOCATED(tidft_env%pair_u)) DEALLOCATE(tidft_env%pair_u)
+      IF (ALLOCATED(tidft_env%pair_v)) DEALLOCATE(tidft_env%pair_v)
 
       ! release the gauge reference copy of the current state's MOs
       IF (ALLOCATED(tidft_env%mat_t_gauge_ref)) THEN
@@ -695,14 +834,14 @@ CONTAINS
 !>        which is +1 for a continuous deformation of the orbitals and -1 if an odd number
 !>        of orbital columns changed sign. The reference copy of the MOs is then updated.
 !> \param tidft_env ...
-!> \param gauge_sign - +1 or -1
+!> \param gauge_sign_spin - +1 or -1 for each spin channel
 !> \par History
 !>       2026.10 created [Rustam Z Khaliullin]
 ! **************************************************************************************************
-   SUBROUTINE multiplier_gauge_sign(tidft_env, gauge_sign)
+   SUBROUTINE multiplier_gauge_sign(tidft_env, gauge_sign_spin)
 
       TYPE(tidft_env_type), INTENT(INOUT)                :: tidft_env
-      REAL(KIND=dp), INTENT(OUT)                         :: gauge_sign
+      REAL(KIND=dp), DIMENSION(2), INTENT(OUT)           :: gauge_sign_spin
 
       CHARACTER(len=*), PARAMETER :: routineN = 'multiplier_gauge_sign', &
          routineP = moduleN//':'//routineN
@@ -711,7 +850,7 @@ CONTAINS
       REAL(KIND=dp)                                      :: det
       TYPE(dbcsr_type)                                   :: tempNO, sigma_ref_new
 
-      gauge_sign = 1.0_dp
+      gauge_sign_spin(:) = 1.0_dp
       cur_state = tidft_env%nstates
       ! the determinant used by the interstate term
       idet = 1
@@ -748,7 +887,7 @@ CONTAINS
                     det = det, &
                     para_env = tidft_env%para_env, &
                     blacs_env = tidft_env%blacs_env)
-            IF (det .LT. 0.0_dp) gauge_sign = -gauge_sign
+            IF (det .LT. 0.0_dp) gauge_sign_spin(ispin) = -1.0_dp
             CALL dbcsr_release(tempNO)
             CALL dbcsr_release(sigma_ref_new)
          ELSE
@@ -765,6 +904,219 @@ CONTAINS
       tidft_env%gauge_ref_set = .TRUE.
 
    END SUBROUTINE multiplier_gauge_sign
+
+! **************************************************************************************************
+!> \brief Smallest principal cosines between the occupied subspaces of states I and J for one
+!>        spin channel: square roots of the smallest eigenvalues of the generalized problem
+!>        sigma_IJ sigma_JJ^-1 sigma_JI w = lambda sigma_II w, solved with LAPACK on replicated
+!>        copies of the small occupied-orbital overlap matrices.
+!> \param tidft_env ...
+!> \param stateI ...
+!> \param stateJ ...
+!> \param idet ...
+!> \param ispin ...
+!> \param cosines - the SIZE(cosines) smallest cosines in increasing order (padded with 1)
+! **************************************************************************************************
+   SUBROUTINE principal_cosines(tidft_env, stateI, stateJ, idet, ispin, cosines)
+
+      TYPE(tidft_env_type), INTENT(INOUT)                :: tidft_env
+      INTEGER, INTENT(IN)                                :: stateI, stateJ, idet, ispin
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: cosines
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'principal_cosines', &
+         routineP = moduleN//':'//routineN
+
+      INTEGER                                            :: nI, nJ, info, lwork, k
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:,:)         :: sII, sJJ, sIJ, b, x
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eig, work
+      TYPE(cp_fm_type)                                   :: fm
+      TYPE(cp_fm_struct_type), POINTER                   :: fm_struct
+
+      cosines(:) = 1.0_dp
+      nI = tidft_env%e_states(stateI)%slater_det(idet)%nelectrons_ab(ispin)
+      nJ = tidft_env%e_states(stateJ)%slater_det(idet)%nelectrons_ab(ispin)
+      IF (nI .LE. 0 .OR. nJ .LE. 0) RETURN
+      ALLOCATE(sII(nI,nI), sJJ(nJ,nJ), sIJ(nI,nJ), b(nI,nI), x(nJ,nI), eig(nI))
+
+      ! replicated copies of the small overlap matrices
+      NULLIFY(fm_struct)
+      CALL cp_fm_struct_create(fm_struct, context=tidft_env%blacs_env, nrow_global=nI, &
+                               ncol_global=nI, para_env=tidft_env%para_env)
+      CALL cp_fm_create(fm, fm_struct)
+      CALL copy_dbcsr_to_fm(tidft_env%mat_sigma(stateI,stateI,idet,ispin), fm)
+      CALL cp_fm_get_submatrix(fm, sII)
+      CALL cp_fm_release(fm)
+      CALL cp_fm_struct_release(fm_struct)
+      CALL cp_fm_struct_create(fm_struct, context=tidft_env%blacs_env, nrow_global=nJ, &
+                               ncol_global=nJ, para_env=tidft_env%para_env)
+      CALL cp_fm_create(fm, fm_struct)
+      CALL copy_dbcsr_to_fm(tidft_env%mat_sigma(stateJ,stateJ,idet,ispin), fm)
+      CALL cp_fm_get_submatrix(fm, sJJ)
+      CALL cp_fm_release(fm)
+      CALL cp_fm_struct_release(fm_struct)
+      ! the interstate MO overlap is stored for stateJ < stateI as sigma_JI (nJ x nI)
+      CALL cp_fm_struct_create(fm_struct, context=tidft_env%blacs_env, nrow_global=nJ, &
+                               ncol_global=nI, para_env=tidft_env%para_env)
+      CALL cp_fm_create(fm, fm_struct)
+      CALL copy_dbcsr_to_fm(tidft_env%mat_sigma(stateJ,stateI,idet,ispin), fm)
+      CALL cp_fm_get_submatrix(fm, x)
+      CALL cp_fm_release(fm)
+      CALL cp_fm_struct_release(fm_struct)
+      sIJ = TRANSPOSE(x)
+
+      ! x <- sigma_JJ^-1 sigma_JI (Cholesky solve), b = sigma_IJ sigma_JJ^-1 sigma_JI
+      CALL dpotrf('U', nJ, sJJ, nJ, info)
+      IF (info .EQ. 0) CALL dpotrs('U', nJ, nI, sJJ, nJ, x, nJ, info)
+      IF (info .NE. 0) THEN
+         DEALLOCATE(sII, sJJ, sIJ, b, x, eig)
+         RETURN
+      ENDIF
+      b = MATMUL(sIJ, x)
+      b = 0.5_dp*(b + TRANSPOSE(b))
+      ! generalized symmetric-definite eigenproblem b w = lambda sigma_II w, ascending eigenvalues
+      lwork = 10*nI + 64
+      ALLOCATE(work(lwork))
+      CALL dsygv(1, 'N', 'U', nI, b, nI, sII, nI, eig, work, lwork, info)
+      IF (info .EQ. 0) THEN
+         DO k = 1, MIN(SIZE(cosines), nI)
+            cosines(k) = SQRT(MAX(eig(k), 0.0_dp))
+         ENDDO
+      ENDIF
+      DEALLOCATE(sII, sJJ, sIJ, b, x, eig, work)
+
+   END SUBROUTINE principal_cosines
+
+! **************************************************************************************************
+!> \brief Replicated dense copy of a small DBCSR matrix
+! **************************************************************************************************
+   SUBROUTINE dbcsr_to_dense(tidft_env, matrix, nrow, ncol, array)
+      TYPE(tidft_env_type), INTENT(IN)                   :: tidft_env
+      TYPE(dbcsr_type), INTENT(IN)                       :: matrix
+      INTEGER, INTENT(IN)                                :: nrow, ncol
+      REAL(KIND=dp), DIMENSION(:,:), INTENT(OUT)         :: array
+      TYPE(cp_fm_type)                                   :: fm
+      TYPE(cp_fm_struct_type), POINTER                   :: fm_struct
+      NULLIFY(fm_struct)
+      CALL cp_fm_struct_create(fm_struct, context=tidft_env%blacs_env, nrow_global=nrow, &
+                               ncol_global=ncol, para_env=tidft_env%para_env)
+      CALL cp_fm_create(fm, fm_struct)
+      CALL copy_dbcsr_to_fm(matrix, fm)
+      CALL cp_fm_get_submatrix(fm, array)
+      CALL cp_fm_release(fm)
+      CALL cp_fm_struct_release(fm_struct)
+   END SUBROUTINE dbcsr_to_dense
+
+! **************************************************************************************************
+!> \brief Fill a small DBCSR matrix (created from a template) from a replicated dense array
+! **************************************************************************************************
+   SUBROUTINE dense_to_dbcsr(tidft_env, array, nrow, ncol, matrix)
+      TYPE(tidft_env_type), INTENT(IN)                   :: tidft_env
+      REAL(KIND=dp), DIMENSION(:,:), INTENT(IN)          :: array
+      INTEGER, INTENT(IN)                                :: nrow, ncol
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: matrix
+      TYPE(cp_fm_type)                                   :: fm
+      TYPE(cp_fm_struct_type), POINTER                   :: fm_struct
+      NULLIFY(fm_struct)
+      CALL cp_fm_struct_create(fm_struct, context=tidft_env%blacs_env, nrow_global=nrow, &
+                               ncol_global=ncol, para_env=tidft_env%para_env)
+      CALL cp_fm_create(fm, fm_struct)
+      CALL cp_fm_set_submatrix(fm, array(1:nrow,1:ncol))
+      CALL copy_fm_to_dbcsr(fm, matrix, keep_sparsity=.FALSE.)
+      CALL cp_fm_release(fm)
+      CALL cp_fm_struct_release(fm_struct)
+   END SUBROUTINE dense_to_dbcsr
+
+! **************************************************************************************************
+!> \brief Rank-one matrix a b^T (nrow x ncol) as a DBCSR matrix created from a template
+! **************************************************************************************************
+   SUBROUTINE rank_one_to_dbcsr(tidft_env, a, nrow, b, ncol, matrix)
+      TYPE(tidft_env_type), INTENT(IN)                   :: tidft_env
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: a, b
+      INTEGER, INTENT(IN)                                :: nrow, ncol
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: matrix
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:,:)         :: array
+      INTEGER                                            :: k
+      ALLOCATE(array(nrow, ncol))
+      DO k = 1, ncol
+         array(:, k) = a(1:nrow) * b(k)
+      ENDDO
+      CALL dense_to_dbcsr(tidft_env, array, nrow, ncol, matrix)
+      DEALLOCATE(array)
+   END SUBROUTINE rank_one_to_dbcsr
+
+! **************************************************************************************************
+!> \brief Orbital-pair constraint: cosine c = u^T sigma_IJ v / sqrt(q r) between the reference
+!>        orbital pair of states I and J with the current orbitals, and q = u^T sigma_II u.
+!>        r = v^T sigma_JJ v is fixed (pair_r) because the orbitals of J do not change.
+! **************************************************************************************************
+   SUBROUTINE orbital_pair_cosine(tidft_env, stateI, stateJ, idet, ispin, c, q)
+      TYPE(tidft_env_type), INTENT(IN)                   :: tidft_env
+      INTEGER, INTENT(IN)                                :: stateI, stateJ, idet, ispin
+      REAL(KIND=dp), INTENT(OUT)                         :: c, q
+      INTEGER                                            :: nI, nJ
+      REAL(KIND=dp)                                      :: p
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:,:)         :: sII, sJI
+      c = 0.0_dp; q = 1.0_dp
+      nI = tidft_env%e_states(stateI)%slater_det(idet)%nelectrons_ab(ispin)
+      nJ = tidft_env%e_states(stateJ)%slater_det(idet)%nelectrons_ab(ispin)
+      IF (nI .LE. 0 .OR. nJ .LE. 0) RETURN
+      ALLOCATE(sII(nI,nI), sJI(nJ,nI))
+      CALL dbcsr_to_dense(tidft_env, tidft_env%mat_sigma(stateI,stateI,idet,ispin), nI, nI, sII)
+      CALL dbcsr_to_dense(tidft_env, tidft_env%mat_sigma(stateJ,stateI,idet,ispin), nJ, nI, sJI)
+      p = DOT_PRODUCT(tidft_env%pair_v(1:nJ,stateJ), MATMUL(sJI, tidft_env%pair_u(1:nI,stateJ)))
+      q = DOT_PRODUCT(tidft_env%pair_u(1:nI,stateJ), MATMUL(sII, tidft_env%pair_u(1:nI,stateJ)))
+      c = p / SQRT(MAX(q, 1.0E-30_dp) * tidft_env%pair_r(stateJ))
+      DEALLOCATE(sII, sJI)
+   END SUBROUTINE orbital_pair_cosine
+
+! **************************************************************************************************
+!> \brief Select the reference orbital pair of states I and J in one spin channel: u is the
+!>        eigenvector of the smallest eigenvalue of sigma_IJ sigma_JJ^-1 sigma_JI u = lambda sigma_II u
+!>        (normalized to u^T sigma_II u = 1), v = sigma_JJ^-1 sigma_JI u so that v^T sigma_JJ v = lambda
+!>        and the cosine u^T sigma_IJ v / sqrt(u^T sigma_II u v^T sigma_JJ v) = sqrt(lambda) = cmin.
+!>        pother is the product of the other principal cosines.
+! **************************************************************************************************
+   SUBROUTINE orbital_pair_select(tidft_env, stateI, stateJ, idet, ispin, u, v, cmin, pother)
+      TYPE(tidft_env_type), INTENT(IN)                   :: tidft_env
+      INTEGER, INTENT(IN)                                :: stateI, stateJ, idet, ispin
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: u, v
+      REAL(KIND=dp), INTENT(OUT)                         :: cmin, pother
+      INTEGER                                            :: nI, nJ, info, lwork, k
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:,:)         :: sII, sJJ, sJI, b, x
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eig, work
+      u(:) = 0.0_dp; v(:) = 0.0_dp; cmin = 1.0_dp; pother = 1.0_dp
+      nI = tidft_env%e_states(stateI)%slater_det(idet)%nelectrons_ab(ispin)
+      nJ = tidft_env%e_states(stateJ)%slater_det(idet)%nelectrons_ab(ispin)
+      IF (nI .LE. 0 .OR. nJ .LE. 0) RETURN
+      ALLOCATE(sII(nI,nI), sJJ(nJ,nJ), sJI(nJ,nI), b(nI,nI), x(nJ,nI), eig(nI))
+      CALL dbcsr_to_dense(tidft_env, tidft_env%mat_sigma(stateI,stateI,idet,ispin), nI, nI, sII)
+      CALL dbcsr_to_dense(tidft_env, tidft_env%mat_sigma(stateJ,stateJ,idet,ispin), nJ, nJ, sJJ)
+      CALL dbcsr_to_dense(tidft_env, tidft_env%mat_sigma(stateJ,stateI,idet,ispin), nJ, nI, sJI)
+      ! x = sigma_JJ^-1 sigma_JI, b = sigma_IJ x
+      x = sJI
+      CALL dpotrf('U', nJ, sJJ, nJ, info)
+      IF (info .EQ. 0) CALL dpotrs('U', nJ, nI, sJJ, nJ, x, nJ, info)
+      IF (info .NE. 0) THEN
+         DEALLOCATE(sII, sJJ, sJI, b, x, eig)
+         RETURN
+      ENDIF
+      b = MATMUL(TRANSPOSE(sJI), x)
+      b = 0.5_dp*(b + TRANSPOSE(b))
+      lwork = 10*nI + 64
+      ALLOCATE(work(lwork))
+      CALL dsygv(1, 'V', 'U', nI, b, nI, sII, nI, eig, work, lwork, info)
+      IF (info .EQ. 0) THEN
+         ! eigenvectors are sigma_II-orthonormal: u^T sigma_II u = 1
+         u(1:nI) = b(:, 1)
+         v(1:nJ) = MATMUL(x, u(1:nI))
+         cmin = SQRT(MAX(eig(1), 0.0_dp))
+         pother = 1.0_dp
+         DO k = 2, nI
+            pother = pother * SQRT(MAX(eig(k), 0.0_dp))
+         ENDDO
+      ENDIF
+      DEALLOCATE(sII, sJJ, sJI, b, x, eig, work)
+   END SUBROUTINE orbital_pair_select
 
 ! **************************************************************************************************
 !> \brief Optimization of MOs using PCG minimizers
@@ -1284,8 +1636,9 @@ CONTAINS
                                                             DetDiagonalSigma, penalty_stateI, &
                                                             DetDiagonalPhi, &
                                                             determinant_spd, &
-                                                            multiplier_term, g_IJ, &
+                                                            multiplier_term, g_IJ, c_IJ, &
                                                             mult_pair_factor, mult_self_factor
+      REAL(KIND=dp), DIMENSION(2)                        :: multiplier_term_spin, phis
       ! aeph: old floor for det(Phi) 
       !REAL(KIND=dp), PARAMETER                          :: eps_det = 1.0E-10_dp
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -1315,7 +1668,11 @@ CONTAINS
                                                             tempOO2, ST, STsiginv
       TYPE(dbcsr_type), ALLOCATABLE, DIMENSION(:,:)      :: mat_g, &
                                                             mat_g_intra, &
-                                                            mat_g_inter
+                                                            mat_g_inter, &
+                                                            mat_g_mult
+      TYPE(dbcsr_type)                                   :: mat_rank1, tempNO3
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:,:)         :: wmat
+      LOGICAL                                            :: pair_mode
       TYPE(dbcsr_type), ALLOCATABLE, DIMENSION(:,:,:)    :: mat_g_energy
       INTEGER                                            :: opposite_spin, para_group_handle
       TYPE(mp_comm_type)                                 :: para_group
@@ -1947,14 +2304,62 @@ CONTAINS
          ! together with the current-row residual max_J |g_IJ| and the
          ! Schur-complement part of the constraint that belongs to state I,
          !   -ln(1 - s^T A^-1 s) = ln(Phi_II * (Phi^-1)_II)
+         ! With MULTIPLIER_SPIN_RESOLVED the constraint function of pair (I,J) is the
+         ! normalized spin overlap c_IJ = Phi~^s_IJ of the channel s = multiplier_channel(J)
+         ! (the smaller one at the last dual update); otherwise it is the product g_IJ.
+         ! The residual is always the product, i.e. the state overlap.
+         multiplier_term_spin(:) = 0.0_dp
          IF (multiplier_term_on) THEN
             tidft_env%multiplier_residual = 0.0_dp
+            tidft_env%residual_pair = 0
             DO stateJ = 1, nstates - 1
                g_IJ = tidft_env%mat_phi(nstates, stateJ) / &
                       SQRT(tidft_env%mat_phi(nstates, nstates) * tidft_env%mat_phi(stateJ, stateJ))
-               multiplier_term = multiplier_term + tidft_env%overlap_multipliers(stateJ) * g_IJ
-               tidft_env%multiplier_residual = MAX(tidft_env%multiplier_residual, ABS(g_IJ))
+               DO ispin = 1, nspins
+                  phis(ispin) = tidft_env%mat_phi_spin(nstates, stateJ, ispin) / &
+                     SQRT(tidft_env%mat_phi_spin(nstates, nstates, ispin) * tidft_env%mat_phi_spin(stateJ, stateJ, ispin))
+               ENDDO
+               IF (tidft_env%multiplier_constraint .EQ. tidft_mult_orbital_pair) THEN
+                  ! cosine between the reference orbital pair with the current orbitals
+                  c_IJ = 0.0_dp
+                  tidft_env%pair_c(stateJ) = 0.0_dp
+                  tidft_env%pair_q(stateJ) = 1.0_dp
+                  IF (tidft_env%pair_r(stateJ) .GT. 0.0_dp) THEN
+                     idet = 1
+                     IF (tidft_env%triplet_correction) idet = 2
+                     CALL orbital_pair_cosine(tidft_env, nstates, stateJ, idet, &
+                                              tidft_env%multiplier_channel(stateJ), &
+                                              tidft_env%pair_c(stateJ), tidft_env%pair_q(stateJ))
+                     c_IJ = tidft_env%pair_c(stateJ)
+                  ENDIF
+                  multiplier_term_spin(tidft_env%multiplier_channel(stateJ)) = &
+                     multiplier_term_spin(tidft_env%multiplier_channel(stateJ)) + &
+                     tidft_env%overlap_multipliers(stateJ) * c_IJ
+               ELSE IF (tidft_env%multiplier_spin_resolved) THEN
+                  c_IJ = phis(tidft_env%multiplier_channel(stateJ))
+                  multiplier_term_spin(tidft_env%multiplier_channel(stateJ)) = &
+                     multiplier_term_spin(tidft_env%multiplier_channel(stateJ)) + &
+                     tidft_env%overlap_multipliers(stateJ) * c_IJ
+               ELSE
+                  c_IJ = g_IJ
+                  multiplier_term_spin(1) = multiplier_term_spin(1) + tidft_env%overlap_multipliers(stateJ) * c_IJ
+               ENDIF
+               IF (ABS(g_IJ) .GT. tidft_env%multiplier_residual) THEN
+                  tidft_env%multiplier_residual = ABS(g_IJ)
+                  tidft_env%residual_pair = stateJ
+                  tidft_env%residual_pair_spin(1:nspins) = phis(1:nspins)
+               ENDIF
             ENDDO
+            multiplier_term = multiplier_term_spin(1) + multiplier_term_spin(2)
+            ! diagnostics: principal cosines of the worst pair in its smaller-overlap channel
+            IF (tidft_env%residual_pair .GT. 0) THEN
+               ispin = 1
+               IF (ABS(tidft_env%residual_pair_spin(2)) .LT. ABS(tidft_env%residual_pair_spin(1))) ispin = 2
+               idet = 1
+               IF (tidft_env%triplet_correction) idet = 2
+               CALL principal_cosines(tidft_env, nstates, tidft_env%residual_pair, idet, ispin, &
+                                      tidft_env%residual_pair_cos)
+            ENDIF
             tidft_env%schur_constraint = LOG(tidft_env%mat_phi(nstates, nstates) * &
                                              tidft_env%mat_phi_inv(nstates, nstates))
          ENDIF
@@ -2002,6 +2407,8 @@ CONTAINS
       ALLOCATE(mat_g_energy(nstates, nspins, ndets))
       ALLOCATE(mat_g_intra(nstates, nspins))
       ALLOCATE(mat_g_inter(nstates, nspins))
+      ALLOCATE(mat_g_mult(nstates, nspins))
+      pair_mode = multiplier_term_on .AND. (tidft_env%multiplier_constraint .EQ. tidft_mult_orbital_pair)
 
       DO ispin = 1, nspins
          DO stateI = first_state, nstates
@@ -2028,6 +2435,9 @@ CONTAINS
                        template=tidft_env%e_states(stateI)%slater_det(idet)%mat_t(ispin))
                CALL dbcsr_set(mat_g_intra(stateI, ispin), 0.0_dp)
                CALL dbcsr_set(mat_g_inter(stateI, ispin), 0.0_dp)
+               CALL dbcsr_create(mat_g_mult(stateI, ispin), &
+                       template=tidft_env%e_states(stateI)%slater_det(idet)%mat_t(ispin))
+               CALL dbcsr_set(mat_g_mult(stateI, ispin), 0.0_dp)
             ENDIF
 
          ENDDO ! stateI
@@ -2372,16 +2782,29 @@ CONTAINS
                                  ! Weight of the pair term: the penalty part (Phi^-1)_JI plus
                                  ! the multiplier part mu_J/SQRT(Phi_II*Phi_JJ), folded into the
                                  ! overall factor -2*lambda_eff applied below
+                                 ! Product constraint: the factor Phi_IJ(opposite spin) multiplies
+                                 ! the multiplier term too. Spin-resolved constraint: the pair term
+                                 ! exists only for the channel of the multiplier, without that factor.
                                  mult_pair_factor = 0.0_dp
-                                 IF (multiplier_term_on .AND. stateJ .LT. stateI) THEN
-                                    mult_pair_factor = tidft_env%overlap_multipliers(stateJ) / &
-                                       SQRT(tidft_env%mat_phi(stateI,stateI) * &
-                                            tidft_env%mat_phi(stateJ,stateJ)) / &
-                                       (-2.0_dp * lambda_eff)
+                                 IF (multiplier_term_on .AND. stateJ .LT. stateI .AND. .NOT. pair_mode) THEN
+                                    IF (tidft_env%multiplier_spin_resolved) THEN
+                                       IF (tidft_env%multiplier_channel(stateJ) .EQ. ispin) THEN
+                                          mult_pair_factor = tidft_env%overlap_multipliers(stateJ) / &
+                                             SQRT(tidft_env%mat_phi_spin(stateI,stateI,ispin) * &
+                                                  tidft_env%mat_phi_spin(stateJ,stateJ,ispin)) / &
+                                             (-2.0_dp * lambda_eff)
+                                       ENDIF
+                                    ELSE
+                                       mult_pair_factor = tidft_env%mat_phi_spin(stateJ,stateI,opposite_spin) * &
+                                          tidft_env%overlap_multipliers(stateJ) / &
+                                          SQRT(tidft_env%mat_phi(stateI,stateI) * &
+                                               tidft_env%mat_phi(stateJ,stateJ)) / &
+                                          (-2.0_dp * lambda_eff)
+                                    ENDIF
                                  ENDIF
                                  CALL dbcsr_scale(tempOO2, &
                                          tidft_env%mat_phi_spin(stateJ,stateI,opposite_spin) * &
-                                         (tidft_env%mat_phi_inv(stateJ,stateI) + mult_pair_factor) )
+                                         tidft_env%mat_phi_inv(stateJ,stateI) + mult_pair_factor )
 
                                  ! S.T_Jindex
                                  ! RZK-WARNING: optimize N^2 re-evaluations to N
@@ -2403,6 +2826,23 @@ CONTAINS
                                          tempOO2, &
                                          1.0_dp, mat_g_inter(stateI, ispin), &
                                          filter_eps=tidft_env%eps_filter)
+                                 ! orbital-pair constraint: mu_J/sqrt(q r) * (S T_J) (v u^T)
+                                 IF (pair_mode .AND. stateJ .LT. stateI) THEN
+                                    IF (tidft_env%multiplier_channel(stateJ) .EQ. ispin .AND. &
+                                        tidft_env%pair_r(stateJ) .GT. 0.0_dp .AND. &
+                                        tidft_env%overlap_multipliers(stateJ) .NE. 0.0_dp) THEN
+                                       CALL dbcsr_create(mat_rank1, template=tidft_env%mat_sigma(stateJ,stateI,idet,ispin))
+                                       CALL rank_one_to_dbcsr(tidft_env, &
+                                               tidft_env%pair_v(1:nmos_stateJ,stateJ), nmos_stateJ, &
+                                               tidft_env%pair_u(1:nmos_stateI,stateJ), nmos_stateI, mat_rank1)
+                                       CALL dbcsr_multiply("N", "N", &
+                                               tidft_env%overlap_multipliers(stateJ) / &
+                                               SQRT(tidft_env%pair_q(stateJ) * tidft_env%pair_r(stateJ)), &
+                                               tempNO2, mat_rank1, 1.0_dp, mat_g_mult(stateI, ispin), &
+                                               filter_eps=tidft_env%eps_filter)
+                                       CALL dbcsr_release(mat_rank1)
+                                    ENDIF
+                                 ENDIF
                                  CALL dbcsr_release(tempNO2)
 
                               ENDIF ! only triplet determinant is used in the penalty
@@ -2419,9 +2859,16 @@ CONTAINS
 
                         ! Normalization term: 2*lambda from the penalty minus SUM_J mu_J*g_IJ
                         ! from the multiplier term, folded into the factor -2*lambda_eff below
+                        ! Spin-resolved constraint: only the multipliers attached to this
+                        ! spin channel contribute to its normalization term
                         mult_self_factor = 1.0_dp
-                        IF (multiplier_term_on) &
-                           mult_self_factor = 1.0_dp - multiplier_term/(2.0_dp*lambda_eff)
+                        IF (multiplier_term_on .AND. .NOT. pair_mode) THEN
+                           IF (tidft_env%multiplier_spin_resolved) THEN
+                              mult_self_factor = 1.0_dp - multiplier_term_spin(ispin)/(2.0_dp*lambda_eff)
+                           ELSE
+                              mult_self_factor = 1.0_dp - multiplier_term/(2.0_dp*lambda_eff)
+                           ENDIF
+                        ENDIF
                         CALL dbcsr_add(mat_g_inter(stateI, ispin), STsiginv, 1.0_dp, -mult_self_factor)
                         ! aeph: original scaling kept for reference/testing
                         !CALL dbcsr_scale(mat_g_inter(stateI, ispin), &
@@ -2429,6 +2876,38 @@ CONTAINS
                         ! aeph: scale by effective ALM multiplier (lambda_eff == lambda when augmented off)
                         CALL dbcsr_scale(mat_g_inter(stateI, ispin), & 
                                 -2.0_dp*lambda_eff)
+                        ! orbital-pair constraint: self term -SUM_J mu_J c_J/q_J (S T_I)(u_J u_J^T)
+                        ! and the pair terms accumulated in mat_g_mult
+                        IF (pair_mode) THEN
+                           ALLOCATE(wmat(nmos_stateI, nmos_stateI))
+                           wmat(:,:) = 0.0_dp
+                           DO stateJ = 1, stateI - 1
+                              IF (tidft_env%multiplier_channel(stateJ) .EQ. ispin .AND. &
+                                  tidft_env%pair_r(stateJ) .GT. 0.0_dp .AND. &
+                                  tidft_env%overlap_multipliers(stateJ) .NE. 0.0_dp) THEN
+                                 DO ivar = 1, nmos_stateI
+                                    wmat(:, ivar) = wmat(:, ivar) + &
+                                       tidft_env%overlap_multipliers(stateJ) * tidft_env%pair_c(stateJ) / &
+                                       tidft_env%pair_q(stateJ) * &
+                                       tidft_env%pair_u(1:nmos_stateI,stateJ) * tidft_env%pair_u(ivar,stateJ)
+                                 ENDDO
+                              ENDIF
+                           ENDDO
+                           IF (MAXVAL(ABS(wmat)) .GT. 0.0_dp) THEN
+                              CALL dbcsr_create(mat_rank1, template=tidft_env%mat_sigma(stateI,stateI,idet,ispin))
+                              CALL dense_to_dbcsr(tidft_env, wmat, nmos_stateI, nmos_stateI, mat_rank1)
+                              CALL dbcsr_create(tempNO3, template=tidft_env%e_states(stateI)%slater_det(idet)%mat_t(ispin))
+                              CALL dbcsr_multiply("N", "N", 1.0_dp, tidft_env%mat_s, &
+                                      tidft_env%e_states(stateI)%slater_det(idet)%mat_t(ispin), &
+                                      0.0_dp, tempNO3, filter_eps=tidft_env%eps_filter)
+                              CALL dbcsr_multiply("N", "N", -1.0_dp, tempNO3, mat_rank1, &
+                                      1.0_dp, mat_g_mult(stateI, ispin), filter_eps=tidft_env%eps_filter)
+                              CALL dbcsr_release(tempNO3)
+                              CALL dbcsr_release(mat_rank1)
+                           ENDIF
+                           DEALLOCATE(wmat)
+                           CALL dbcsr_add(mat_g_inter(stateI, ispin), mat_g_mult(stateI, ispin), 1.0_dp, 1.0_dp)
+                        ENDIF
 
                         DO ivar = 1, 3
                            IF (tidft_env%e_states(stateI)%slater_det(1)%ncols_var(ivar).NE.0) THEN
@@ -2520,11 +2999,13 @@ CONTAINS
             CALL dbcsr_release(mat_g_intra(stateI, ispin))
             !CALL dbcsr_print(mat_g_inter(stateI, ispin))
             CALL dbcsr_release(mat_g_inter(stateI, ispin))
+            CALL dbcsr_release(mat_g_mult(stateI, ispin))
          ENDDO ! stateI
       ENDDO ! ispin
       DEALLOCATE(mat_g_energy)
       DEALLOCATE(mat_g_intra)
       DEALLOCATE(mat_g_inter)
+      DEALLOCATE(mat_g_mult)
 
       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
       ! Print detailed objective function info
