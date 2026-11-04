@@ -280,11 +280,15 @@ CONTAINS
                                                             constraint_c, & ! aeph
                                                             constraint_c_prev ! aeph: previous outer-iter dummy |c|
       ! signed-overlap multiplier method
-      LOGICAL                                            :: mult_on
+      LOGICAL                                            :: mult_on, &
+                                                            sg_fired ! aeph: safeguard grew C_P
       INTEGER                                            :: stateJ, cur_state, ispin, &
                                                             idet, nmos
       REAL(KIND=dp)                                      :: residual, residual_prev, &
-                                                            gauge_sign, lambda_dual
+                                                            gauge_sign, lambda_dual, &
+                                                            mult_shift, cp_before, & ! aeph: shift, C_P of the solve
+                                                            r_ratio ! aeph: r/r_prev, -1 at the first update
+      CHARACTER(LEN=6)                                   :: shift_src ! aeph: INPUT/AUTO, "*" = not applied
       ! aeph: the det(phi) threshold is read from input (tidft_env%eps_det, default 1.0E-10)
       !REAL(KIND=dp), PARAMETER                           :: tau_c  ! aeph: ALM decrease ratio for mu in tidft_env%alm_decrease_ratio
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -323,7 +327,9 @@ CONTAINS
       constraint_c_prev = -1.0_dp ! aeph: initial, no previous |c| yet
       ! signed-overlap multiplier method: active only for excited states
       ! (previous states are frozen in the state-by-state optimization)
+      ! aeph: and only with the energy term on (not in the PRE_ORTHOGONALIZE_STATES pass)
       mult_on = tidft_env%multiplier_component .AND. &
+                tidft_env%loss_function_components(1) .AND. &
                 tidft_env%loss_function_components(3) .AND. &
                 tidft_env%nstates .GT. 1
       cur_state = tidft_env%nstates
@@ -332,6 +338,10 @@ CONTAINS
       gauge_sign = 1.0_dp
       tidft_env%overlap_multipliers(:) = 0.0_dp
       tidft_env%gauge_ref_set = .FALSE.
+      ! aeph: MULTIPLIER_CURVATURE_AUTO: arm the capture of Delta E_I, taken at the first
+      ! aeph: loss evaluation of this pass (= starting MOs of state I, energy term on)
+      tidft_env%multiplier_delta_e = 0.0_dp
+      tidft_env%multiplier_capture_de = mult_on .AND. tidft_env%multiplier_curvature_auto
       ! aeph: we reset mu to the input value at each penalty-strength pass (per state)
       IF (tidft_env%loss_function_components(4) .AND. &
          tidft_env%loss_function_components(3)) THEN
@@ -468,9 +478,15 @@ CONTAINS
             ! signed-overlap multiplier method: converged when the current-row
             ! residual is below the threshold and the orbitals are tightly converged
             residual = tidft_env%multiplier_residual
-            IF (residual .LE. tidft_env%allowed_max_norm_phi_mI .AND. &
-                current_eps_scf .LE. save_eps_scf*(1.0_dp + 1.0E-12_dp)) THEN
-               EXIT
+            IF (residual .LE. tidft_env%allowed_max_norm_phi_mI) THEN
+               IF (current_eps_scf .LE. save_eps_scf*(1.0_dp + 1.0E-12_dp)) THEN
+                  EXIT
+               ELSE
+                  ! aeph: constraint met by a loose solve: no gauge check, dual update
+                  ! aeph: or C_P growth; re-polish at the tight EPS_ERROR (as for ALM)
+                  current_eps_scf = save_eps_scf
+                  CYCLE
+               ENDIF
             ENDIF
             IF (iteration .GE. tidft_env%multiplier_max_iter) THEN
                CPWARN("MULTIPLIER_MAX_ITER reached before the interstate constraint was satisfied")
@@ -572,10 +588,29 @@ CONTAINS
             ! where (Phi~^-1)_JI = SQRT(Phi_II*Phi_JJ)*(Phi^-1)_JI is the inverse of
             ! the normalized overlap matrix; this is exact for any frozen block of
             ! previous states and reduces to mu_J + 2*lambda*g_IJ for small overlaps
-            lambda_dual = tidft_env%interstate_nonorthogonality_penalty_coeff - &
-                          tidft_env%multiplier_curvature_shift
-            IF (lambda_dual .LE. 0.0_dp) &
-               lambda_dual = tidft_env%interstate_nonorthogonality_penalty_coeff
+            ! aeph: lambda_dual = C_P - shift; shift = MULTIPLIER_CURVATURE_SHIFT ("INPUT") or
+            ! aeph: Delta E_I of the starting MOs ("AUTO"); not applied ("*", warning) if
+            ! aeph: Delta E_I <= 0 or C_P - shift <= 0
+            cp_before = tidft_env%interstate_nonorthogonality_penalty_coeff
+            IF (tidft_env%multiplier_curvature_auto) THEN
+               mult_shift = tidft_env%multiplier_delta_e
+               shift_src = "AUTO"
+            ELSE
+               mult_shift = tidft_env%multiplier_curvature_shift
+               shift_src = "INPUT"
+            ENDIF
+            lambda_dual = cp_before - mult_shift
+            IF (tidft_env%multiplier_curvature_auto .AND. mult_shift .LE. 0.0_dp) THEN
+               IF (residual_prev .LT. 0.0_dp) THEN
+                  CPWARN("MULTIPLIER_CURVATURE_AUTO: Delta E of the starting MOs <= 0, dual step uses C_P")
+               ENDIF
+               lambda_dual = cp_before
+               shift_src = "AUTO*"
+            ELSE IF (lambda_dual .LE. 0.0_dp) THEN
+               CPWARN("C_P - MULTIPLIER curvature shift <= 0, dual step uses C_P")
+               lambda_dual = cp_before
+               shift_src = TRIM(shift_src)//"*"
+            ENDIF
             DO stateJ = 1, cur_state - 1
                tidft_env%overlap_multipliers(stateJ) = &
                   gauge_sign * tidft_env%overlap_multipliers(stateJ) - &
@@ -584,11 +619,28 @@ CONTAINS
                   tidft_env%mat_phi_inv(stateJ,cur_state)
             ENDDO
             ! safeguard: grow lambda only if the residual failed to decrease
-            IF (residual_prev .GE. 0.0_dp .AND. &
-                residual .GT. tidft_env%multiplier_safeguard_ratio * residual_prev) THEN
+            sg_fired = (residual_prev .GE. 0.0_dp .AND. &
+                        residual .GT. tidft_env%multiplier_safeguard_ratio * residual_prev)
+            IF (sg_fired) THEN
                tidft_env%interstate_nonorthogonality_penalty_coeff = &
                   tidft_env%interstate_nonorthogonality_penalty_coeff * &
                   ABS(tidft_env%penalty_strength_inc_factor)
+            ENDIF
+            ! aeph: one line per dual update (legend at the first update of the state);
+            ! aeph: current_eps_scf already holds the tolerance of the next inner solve
+            IF (unit_nr > 0) THEN
+               r_ratio = -1.0_dp
+               IF (residual_prev .GT. 0.0_dp) r_ratio = residual/residual_prev
+               IF (residual_prev .LT. 0.0_dp) THEN
+                  WRITE (unit_nr, '(T2,A19,2A5,2A11,4A12,1X,A6,A2,A3,A11)') &
+                     "MULT-UPDATE", "St", "It", "r", "r/r_prev", "C_P_old", "C_P_new", &
+                     "lambda_dual", "shift", "src   ", "SG", "GS", "next_eps"
+               ENDIF
+               WRITE (unit_nr, '(T2,A19,2I5,2ES11.3,4ES12.4,1X,A6,L2,I3,ES11.3)') &
+                  "MULT-UPDATE:", cur_state, iteration, residual, r_ratio, &
+                  cp_before, tidft_env%interstate_nonorthogonality_penalty_coeff, &
+                  lambda_dual, mult_shift, shift_src, sg_fired, NINT(gauge_sign), &
+                  current_eps_scf
             ENDIF
             residual_prev = residual
          ELSE IF (alm_on .AND. .NOT. alm_deferred) THEN
@@ -665,6 +717,12 @@ CONTAINS
             print_string = "Final current-row residual max|g_IJ|:"
             WRITE (unit_nr, '(T2,A59,ES20.6)') &
                print_string, tidft_env%multiplier_residual
+            ! aeph: curvature shift captured for this state (MULTIPLIER_CURVATURE_AUTO)
+            IF (tidft_env%multiplier_curvature_auto) THEN
+               print_string = "Curvature shift Delta E of the starting MOs:"
+               WRITE (unit_nr, '(T2,A59,F20.10)') &
+                  print_string, tidft_env%multiplier_delta_e
+            ENDIF
          ENDIF
 
          WRITE (unit_nr, '(T2,A)') REPEAT("-", 79)
@@ -1679,6 +1737,15 @@ CONTAINS
          DEALLOCATE(mat_proj)
 
       ENDIF ! energy_component
+
+      ! aeph: MULTIPLIER_CURVATURE_AUTO: Delta E_I = E_I - E_ground at the first energy
+      ! aeph: evaluation of state I (flag armed in penalty_strength_variation); state_energy
+      ! aeph: is 2E(mixed)-E(triplet) with SPIN_PURE, as in the loss and the post-SCF
+      IF (tidft_env%multiplier_capture_de .AND. energy_component) THEN
+         tidft_env%multiplier_delta_e = tidft_env%e_states(nstates)%state_energy - &
+                                        tidft_env%e_states(1)%state_energy
+         tidft_env%multiplier_capture_de = .FALSE.
+      ENDIF
 
       ! Return the sum of all energies to QS
       CALL get_qs_env(qs_env, energy=qs_energy)

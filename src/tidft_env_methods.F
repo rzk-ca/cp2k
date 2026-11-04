@@ -295,6 +295,18 @@ CONTAINS
       CALL section_vals_val_get(penalty_section, &
                                 "MULTIPLIER_CURVATURE_SHIFT", &
                                 r_val=tidft_env%multiplier_curvature_shift)
+      ! aeph: a negative shift would enlarge the dual step
+      IF (tidft_env%multiplier_curvature_shift .LT. 0.0_dp) THEN
+         CPABORT("MULTIPLIER_CURVATURE_SHIFT must be >= 0")
+      ENDIF
+      ! aeph: automatic shift = Delta E of the starting MOs of each excited state
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_CURVATURE_AUTO", &
+                                l_val=tidft_env%multiplier_curvature_auto)
+      IF (tidft_env%multiplier_curvature_auto .AND. &
+          tidft_env%multiplier_curvature_shift .GT. 0.0_dp) THEN
+         CPWARN("MULTIPLIER_CURVATURE_SHIFT is ignored with MULTIPLIER_CURVATURE_AUTO")
+      ENDIF
       CALL section_vals_val_get(penalty_section, &
                                 "MULTIPLIER_INNER_TOL_FACTOR", &
                                 r_val=tidft_env%multiplier_inner_tol_factor)
@@ -302,6 +314,11 @@ CONTAINS
       CALL section_vals_val_get(penalty_section, &
                                 "MULTIPLIER_MAX_ITER", &
                                 i_val=tidft_env%multiplier_max_iter)
+      ! aeph: the multiplier gradient divides by the interstate strength (0/0 at zero)
+      IF (tidft_env%multiplier_component .AND. &
+          tidft_env%interstate_nonorthogonality_penalty_coeff .LE. 0.0_dp) THEN
+         CPABORT("MULTIPLIER_COMPONENT requires INTERSTATE_NON_PENALTY_STRENGTH > 0")
+      ENDIF
 
       ! CINDY: Pass input from WF_GUESS section
       WF_guess_section => section_vals_get_subs_vals(tidft_section, "WF_GUESS")

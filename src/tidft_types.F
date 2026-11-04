@@ -194,6 +194,12 @@ MODULE tidft_types
       REAL(KIND=dp)                                      :: multiplier_safeguard_ratio
       ! estimated excitation energy used in the curvature-corrected dual step
       REAL(KIND=dp)                                      :: multiplier_curvature_shift
+      ! aeph: MULTIPLIER_CURVATURE_AUTO: shift = Delta E_I = E_I(starting MOs) - E_ground;
+      ! aeph: capture flag armed per state in penalty_strength_variation, consumed at the
+      ! aeph: first energy evaluation in mainvar_to_loss_and_gradient
+      LOGICAL                                            :: multiplier_curvature_auto = .FALSE.
+      LOGICAL                                            :: multiplier_capture_de = .FALSE.
+      REAL(KIND=dp)                                      :: multiplier_delta_e = 0.0_dp
       ! inner tolerance for the next solve = this fraction of the current residual
       ! (never looser than the previous solve, never tighter than EPS_ERROR)
       REAL(KIND=dp)                                      :: multiplier_inner_tol_factor

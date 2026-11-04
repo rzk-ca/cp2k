@@ -569,9 +569,24 @@ CONTAINS
                           description="Used with MULTIPLIER_COMPONENT. Estimated excitation energy "// &
                           "(Hartree) of the current state above the ground state. The dual step "// &
                           "uses 2*(lambda - shift) instead of 2*lambda, which is exact for the "// &
-                          "two-level model of the collapse. Zero gives the plain multiplier update.", &
+                          "two-level model of the collapse. Zero gives the plain multiplier update. "// &
+                          "Must not be negative. If lambda - shift is not positive, a warning is "// &
+                          "printed and 2*lambda is used. Ignored with MULTIPLIER_CURVATURE_AUTO.", &
                           usage="MULTIPLIER_CURVATURE_SHIFT 0.0", &
                           default_r_val=0.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      ! aeph: automatic curvature shift from the excitation energy of the starting MOs
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_CURVATURE_AUTO", &
+                          description="Used with MULTIPLIER_COMPONENT. Use as the curvature shift the "// &
+                          "excitation energy Delta E = E_I - E_ground (Hartree) of the starting orbitals "// &
+                          "of each excited state I, taken at its first energy evaluation, so that the "// &
+                          "dual step uses 2*(lambda - Delta E). MULTIPLIER_CURVATURE_SHIFT is ignored. "// &
+                          "If Delta E or lambda - Delta E is not positive, a warning is printed and the "// &
+                          "plain step 2*lambda is used.", &
+                          usage="MULTIPLIER_CURVATURE_AUTO .TRUE.", default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
