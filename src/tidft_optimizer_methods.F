@@ -281,6 +281,7 @@ CONTAINS
                                                             constraint_c_prev ! aeph: previous outer-iter dummy |c|
       ! signed-overlap multiplier method
       LOGICAL                                            :: mult_on, &
+                                                            row_exit, & ! aeph: current-row stop test + cap
                                                             sg_fired ! aeph: safeguard grew C_P
       INTEGER                                            :: stateJ, cur_state, ispin, &
                                                             idet, nmos
@@ -289,6 +290,17 @@ CONTAINS
                                                             mult_shift, cp_before, & ! aeph: shift, C_P of the solve
                                                             r_ratio ! aeph: r/r_prev, -1 at the first update
       CHARACTER(LEN=6)                                   :: shift_src ! aeph: INPUT/AUTO, "*" = not applied
+      ! aeph: 3 - quasi-Newton (type-II Broyden) dual step mu <- mu + H y, H = 2 C_P I + K,
+      ! aeph: K learned in nu = mu + 2 C_P y coordinates (C_P independent in the linear model)
+      LOGICAL                                            :: qn_on, qn_started, qn_have_prev, &
+                                                            qn_backtracked, qn_rise, qn_ok
+      INTEGER                                            :: qn_n, qn_slow, jq, kq
+      REAL(KIND=dp)                                      :: qn_cp_prev, qn_eps_prev, eps_solved, &
+                                                            qn_dd, qn_hmin, qn_hmax, qn_stepmax
+      CHARACTER(LEN=9)                                   :: qn_action
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: qn_mu, qn_y, qn_mu_prev, qn_y_prev, &
+                                                            qn_dmu, qn_dy, qn_hdy, qn_step
+      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE        :: qn_k, qn_kgood, qn_h, qn_htry, qn_sym
       ! aeph: the det(phi) threshold is read from input (tidft_env%eps_det, default 1.0E-10)
       !REAL(KIND=dp), PARAMETER                           :: tau_c  ! aeph: ALM decrease ratio for mu in tidft_env%alm_decrease_ratio
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -327,12 +339,32 @@ CONTAINS
       constraint_c_prev = -1.0_dp ! aeph: initial, no previous |c| yet
       ! signed-overlap multiplier method: active only for excited states
       ! (previous states are frozen in the state-by-state optimization)
-      ! aeph: and only with the energy term on (not in the PRE_ORTHOGONALIZE_STATES pass)
-      mult_on = tidft_env%multiplier_component .AND. &
-                tidft_env%loss_function_components(1) .AND. &
-                tidft_env%loss_function_components(3) .AND. &
-                tidft_env%nstates .GT. 1
+      ! aeph: the stop test on the current-row residual with the MULTIPLIER_MAX_ITER cap applies to
+      ! aeph: every multiplier pass (row_exit); the dual updates need the energy term (mult_on), so
+      ! aeph: the energy-off PRE_ORTHOGONALIZE_STATES pass stops on the current row without updates
+      row_exit = tidft_env%multiplier_component .AND. &
+                 tidft_env%loss_function_components(3) .AND. &
+                 tidft_env%nstates .GT. 1
+      mult_on = row_exit .AND. tidft_env%loss_function_components(1)
       cur_state = tidft_env%nstates
+      ! aeph: 3 - quasi-Newton dual step (opt-in), state reset for every state
+      qn_on = mult_on .AND. tidft_env%multiplier_quasi_newton
+      qn_n = cur_state - 1
+      qn_started = .FALSE.
+      qn_have_prev = .FALSE.
+      qn_backtracked = .FALSE.
+      qn_slow = 0
+      qn_cp_prev = 0.0_dp
+      qn_eps_prev = 0.0_dp
+      eps_solved = 0.0_dp
+      IF (qn_on) THEN
+         ALLOCATE (qn_mu(qn_n), qn_y(qn_n), qn_mu_prev(qn_n), qn_y_prev(qn_n), &
+                   qn_dmu(qn_n), qn_dy(qn_n), qn_hdy(qn_n), qn_step(qn_n))
+         ALLOCATE (qn_k(qn_n, qn_n), qn_kgood(qn_n, qn_n), qn_h(qn_n, qn_n), &
+                   qn_htry(qn_n, qn_n), qn_sym(qn_n, qn_n))
+         qn_k(:, :) = 0.0_dp
+         qn_kgood(:, :) = 0.0_dp
+      ENDIF
       residual = 0.0_dp
       residual_prev = -1.0_dp
       gauge_sign = 1.0_dp
@@ -421,7 +453,9 @@ CONTAINS
                  qs_env=qs_env, &
                  tidft_env=tidft_env, &
                  optimizer=tidft_env%tidft_optimizer_pcg)
-         ! aeph:  The constraint is measurable only when det(Phi) is above EPS_DET; otherwise it uses 
+         ! aeph: 3 - tolerance of the solve just finished (secants only between equal tolerances)
+         eps_solved = current_eps_scf
+         ! aeph:  The constraint is measurable only when det(Phi) is above EPS_DET; otherwise it uses
          ! in ALM warm-up and behave like the plain penalty method.
          alm_on = tidft_env%loss_function_components(4) .AND. &
                   tidft_env%loss_function_components(3)
@@ -444,7 +478,7 @@ CONTAINS
             WRITE (unit_nr, '(T2,A19,F30.10,F30.10)') "|Phi-I|_max:", &
                tidft_env%interstate_nonorthogonality_penalty_coeff, &
                tidft_env%max_norm_mat_phi_mI
-            IF (mult_on) THEN
+            IF (row_exit) THEN
                ! residual of the current row max_J|g_IJ| and the part of
                ! -ln det(Phi) that belongs to the current state
                WRITE (unit_nr, '(T2,A19,ES30.6,ES30.6)') "ROW-RESIDUAL, C_I:", &
@@ -474,7 +508,7 @@ CONTAINS
          ! aeph: original waits until NSTEPS_STRENGTH, then checks |Phi-I|_max;
          ! aeph: ALM exits as soon as the constraint is satisfied, but only
          ! aeph: after a final pass at the tight EPS_ERROR (jump to it if still loose)
-         IF (mult_on) THEN
+         IF (row_exit) THEN
             ! signed-overlap multiplier method: converged when the current-row
             ! residual is below the threshold and the orbitals are tightly converged
             residual = tidft_env%multiplier_residual
@@ -607,20 +641,122 @@ CONTAINS
                lambda_dual = cp_before
                shift_src = "AUTO*"
             ELSE IF (lambda_dual .LE. 0.0_dp) THEN
-               CPWARN("C_P - MULTIPLIER curvature shift <= 0, dual step uses C_P")
+               ! aeph: once per state; the "*" in the src column marks every affected update
+               IF (residual_prev .LT. 0.0_dp) THEN
+                  CPWARN("C_P - MULTIPLIER curvature shift <= 0, dual step uses C_P")
+               ENDIF
                lambda_dual = cp_before
                shift_src = TRIM(shift_src)//"*"
             ENDIF
-            DO stateJ = 1, cur_state - 1
-               tidft_env%overlap_multipliers(stateJ) = &
-                  gauge_sign * tidft_env%overlap_multipliers(stateJ) - &
-                  2.0_dp * lambda_dual * &
-                  SQRT(tidft_env%mat_phi(cur_state,cur_state) * tidft_env%mat_phi(stateJ,stateJ)) * &
-                  tidft_env%mat_phi_inv(stateJ,cur_state)
-            ENDDO
-            ! safeguard: grow lambda only if the residual failed to decrease
-            sg_fired = (residual_prev .GE. 0.0_dp .AND. &
-                        residual .GT. tidft_env%multiplier_safeguard_ratio * residual_prev)
+            IF (qn_on) THEN
+               ! aeph: 3 - quasi-Newton dual step mu <- mu + H y on the same residual as the fixed
+               ! aeph: step, y_J = -SQRT(Phi_II*Phi_JJ)*(Phi^-1)_JI (~ g_IJ), with H = 2 C_P I + K
+               DO jq = 1, qn_n
+                  qn_y(jq) = -SQRT(tidft_env%mat_phi(cur_state, cur_state)*tidft_env%mat_phi(jq, jq))* &
+                             tidft_env%mat_phi_inv(jq, cur_state)
+                  qn_mu(jq) = gauge_sign*tidft_env%overlap_multipliers(jq)
+               ENDDO
+               IF (.NOT. qn_started) THEN
+                  ! aeph: K0 from the curvature shift, so the first step is the fixed step 2*lambda_dual*y
+                  qn_k(:, :) = 0.0_dp
+                  DO jq = 1, qn_n
+                     qn_k(jq, jq) = 2.0_dp*(lambda_dual - cp_before)
+                  ENDDO
+                  qn_kgood(:, :) = qn_k(:, :)
+                  qn_started = .TRUE.
+               ENDIF
+               IF (qn_have_prev) THEN
+                  qn_mu_prev(:) = gauge_sign*qn_mu_prev(:)
+                  qn_y_prev(:) = gauge_sign*qn_y_prev(:)
+               ENDIF
+               qn_rise = qn_have_prev .AND. (residual_prev .GE. 0.0_dp) .AND. (residual .GT. residual_prev)
+               sg_fired = .FALSE.
+               IF (qn_rise .AND. .NOT. qn_backtracked) THEN
+                  ! aeph: the residual rose after a QN step: go back halfway towards the last good
+                  ! aeph: multipliers and restore the last good K; the secant history stays there
+                  tidft_env%overlap_multipliers(1:qn_n) = qn_mu_prev(:) + 0.5_dp*(qn_mu(:) - qn_mu_prev(:))
+                  qn_step(:) = tidft_env%overlap_multipliers(1:qn_n) - qn_mu(:)
+                  qn_k(:, :) = qn_kgood(:, :)
+                  qn_backtracked = .TRUE.
+                  qn_slow = 0
+                  qn_action = "BACKTRACK"
+               ELSE
+                  ! aeph: the backtracked point did not help either: grow C_P (K carries over)
+                  IF (qn_rise) sg_fired = .TRUE.
+                  qn_h(:, :) = qn_k(:, :)
+                  DO jq = 1, qn_n
+                     qn_h(jq, jq) = qn_h(jq, jq) + 2.0_dp*cp_before
+                  ENDDO
+                  qn_action = "FIXED"
+                  IF (qn_have_prev) THEN
+                     ! aeph: secant in nu = mu + 2 C_P y (C_P independent): H dy = -dnu with
+                     ! aeph: dnu = dmu + 2 C_P dy + 2 (C_P - C_P,prev) y_prev
+                     qn_dmu(:) = qn_mu(:) - qn_mu_prev(:) + 2.0_dp*(cp_before - qn_cp_prev)*qn_y_prev(:)
+                     qn_dy(:) = qn_y(:) - qn_y_prev(:)
+                     qn_dd = DOT_PRODUCT(qn_dy, qn_dy)
+                     qn_action = "NOISE"
+                     IF (ABS(eps_solved - qn_eps_prev) .GT. 1.0E-12_dp*eps_solved) THEN
+                        qn_action = "TOLCHANGE"
+                     ELSE IF (SQRT(qn_dd) .GE. MAX(1.0E-6_dp, 0.05_dp*SQRT(DOT_PRODUCT(qn_y_prev, qn_y_prev)))) THEN
+                        ! aeph: type-II Broyden (positive denominator): H_new = H - (dmu + H dy) dy^T/(dy^T dy)
+                        qn_hdy(:) = MATMUL(qn_h, qn_dy)
+                        DO kq = 1, qn_n
+                           qn_htry(:, kq) = qn_h(:, kq) - (qn_dmu(:) + qn_hdy(:))*qn_dy(kq)/qn_dd
+                        ENDDO
+                        ! aeph: accept only if the symmetric part of H - C_P I is positive definite
+                        qn_sym(:, :) = 0.5_dp*(qn_htry(:, :) + TRANSPOSE(qn_htry(:, :)))
+                        DO jq = 1, qn_n
+                           qn_sym(jq, jq) = qn_sym(jq, jq) - cp_before
+                        ENDDO
+                        CALL tidft_pp_spd_inverse(qn_sym, qn_n, qn_ok)
+                        IF (qn_ok) THEN
+                           qn_h(:, :) = qn_htry(:, :)
+                           qn_k(:, :) = qn_h(:, :)
+                           DO jq = 1, qn_n
+                              qn_k(jq, jq) = qn_k(jq, jq) - 2.0_dp*cp_before
+                           ENDDO
+                           qn_action = "ACCEPT"
+                        ELSE
+                           qn_action = "REJECT"
+                        ENDIF
+                     ENDIF
+                  ENDIF
+                  qn_step(:) = MATMUL(qn_h, qn_y)
+                  tidft_env%overlap_multipliers(1:qn_n) = qn_mu(:) + qn_step(:)
+                  qn_mu_prev(:) = qn_mu(:)
+                  qn_y_prev(:) = qn_y(:)
+                  qn_cp_prev = cp_before
+                  qn_eps_prev = eps_solved
+                  qn_have_prev = .TRUE.
+                  IF (.NOT. qn_rise) THEN
+                     qn_kgood(:, :) = qn_k(:, :)
+                     qn_backtracked = .FALSE.
+                  ENDIF
+                  ! aeph: slow-contraction fallback (no cap): grow C_P after 3 consecutive updates
+                  ! aeph: whose residual fell by less than MULTIPLIER_SAFEGUARD_RATIO
+                  IF (residual_prev .GE. 0.0_dp .AND. &
+                      residual .GT. tidft_env%multiplier_safeguard_ratio*residual_prev) THEN
+                     qn_slow = qn_slow + 1
+                  ELSE
+                     qn_slow = 0
+                  ENDIF
+                  IF (qn_slow .GE. 3) THEN
+                     sg_fired = .TRUE.
+                     qn_slow = 0
+                  ENDIF
+               ENDIF
+            ELSE
+               DO stateJ = 1, cur_state - 1
+                  tidft_env%overlap_multipliers(stateJ) = &
+                     gauge_sign * tidft_env%overlap_multipliers(stateJ) - &
+                     2.0_dp * lambda_dual * &
+                     SQRT(tidft_env%mat_phi(cur_state,cur_state) * tidft_env%mat_phi(stateJ,stateJ)) * &
+                     tidft_env%mat_phi_inv(stateJ,cur_state)
+               ENDDO
+               ! safeguard: grow lambda only if the residual failed to decrease
+               sg_fired = (residual_prev .GE. 0.0_dp .AND. &
+                           residual .GT. tidft_env%multiplier_safeguard_ratio * residual_prev)
+            ENDIF
             IF (sg_fired) THEN
                tidft_env%interstate_nonorthogonality_penalty_coeff = &
                   tidft_env%interstate_nonorthogonality_penalty_coeff * &
@@ -641,6 +777,15 @@ CONTAINS
                   cp_before, tidft_env%interstate_nonorthogonality_penalty_coeff, &
                   lambda_dual, mult_shift, shift_src, sg_fired, NINT(gauge_sign), &
                   current_eps_scf
+               ! aeph: 3 - quasi-Newton action, range of diag(H)/2 (effective lambda per pair),
+               ! aeph: largest |dmu| of this update and the slow-update counter
+               IF (qn_on) THEN
+                  qn_hmin = 0.5_dp*MINVAL((/(qn_k(jq, jq), jq=1, qn_n)/)) + cp_before
+                  qn_hmax = 0.5_dp*MAXVAL((/(qn_k(jq, jq), jq=1, qn_n)/)) + cp_before
+                  qn_stepmax = MAXVAL(ABS(qn_step(:)))
+                  WRITE (unit_nr, '(T2,A19,2I5,1X,A9,3ES12.4,I3)') "MULT-QN:", cur_state, iteration, &
+                     qn_action, qn_hmin, qn_hmax, qn_stepmax, qn_slow
+               ENDIF
             ENDIF
             residual_prev = residual
          ELSE IF (alm_on .AND. .NOT. alm_deferred) THEN
@@ -741,6 +886,14 @@ CONTAINS
          ENDIF
          DEALLOCATE(tidft_env%mat_t_gauge_ref)
          tidft_env%gauge_ref_set = .FALSE.
+      ENDIF
+
+      ! aeph: 2b - the penalty preconditioner vectors belong to this state only
+      CALL tidft_pp_release(tidft_env)
+      ! aeph: 3 - quasi-Newton state of this state
+      IF (qn_on) THEN
+         DEALLOCATE (qn_mu, qn_y, qn_mu_prev, qn_y_prev, qn_dmu, qn_dy, qn_hdy, qn_step)
+         DEALLOCATE (qn_k, qn_kgood, qn_h, qn_htry, qn_sym)
       ENDIF
 
       tidft_env%tidft_optimizer_pcg%eps_error = save_eps_scf
@@ -935,6 +1088,9 @@ CONTAINS
             ! compute objective (loss) function
             ! compute the gradient
             loss_components(:) = 0.0_dp
+            ! aeph: 2b - the evaluation at iteration 0 precedes the preconditioner rebuild,
+            ! aeph: so it captures the constraint gradients u_J for the Woodbury correction
+            tidft_env%pp_capture = (iteration .EQ. 0) .AND. (.NOT. tidft_env%numerical_gradient)
             IF (tidft_env%numerical_gradient) THEN
                CALL tidft_optimizer_numerical_gradient( &
                        qs_env = qs_env, &
@@ -1343,7 +1499,8 @@ CONTAINS
                                                             DetDiagonalPhi, &
                                                             determinant_spd, &
                                                             multiplier_term, g_IJ, &
-                                                            mult_pair_factor, mult_self_factor
+                                                            pair_weight, self_weight, & ! aeph: 2a
+                                                            pp_coef, pp_s ! aeph: 2b
       ! aeph: old floor for det(Phi) 
       !REAL(KIND=dp), PARAMETER                          :: eps_det = 1.0E-10_dp
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -1366,11 +1523,13 @@ CONTAINS
                                                             augmented_penalty_component,  &
                                                             alm_active, & ! aeph: ALM gate warm up
                                                             multiplier_term_on, &
-                                                            not_evaluated
+                                                            not_evaluated, &
+                                                            pp_capture_now ! aeph: 2b
 
       ! GRADIENT
       TYPE(dbcsr_type)                                   :: tempNO2, tempOO1, &
-                                                            tempOO2, ST, STsiginv
+                                                            tempOO2, ST, STsiginv, &
+                                                            pp_x ! aeph: 2b, u_J in MO form
       TYPE(dbcsr_type), ALLOCATABLE, DIMENSION(:,:)      :: mat_g, &
                                                             mat_g_intra, &
                                                             mat_g_inter
@@ -2104,6 +2263,28 @@ CONTAINS
 
       ALLOCATE(gradient_temp(3))
 
+      ! aeph: 2b - capture the constraint gradients u_J (J < I) for the penalty preconditioner, only
+      ! aeph: at the evaluation that precedes a preconditioner rebuild (pp_capture, set at iteration 0)
+      pp_capture_now = tidft_env%pp_capture .AND. tidft_env%prec_penalty .AND. &
+                       tidft_env%state_by_state .AND. interstate_penalty_component .AND. &
+                       (nstates .GE. 2) .AND. (lambda_eff .GT. 0.0_dp)
+      tidft_env%pp_capture = .FALSE.
+      IF (pp_capture_now) THEN
+         CALL tidft_pp_release(tidft_env)
+         tidft_env%pp_state = nstates
+         tidft_env%pp_m = nstates - 1
+         tidft_env%pp_ncols(:) = tidft_env%e_states(nstates)%slater_det(1)%ncols_var(:)
+         ALLOCATE(tidft_env%mat_pp_u(tidft_env%pp_m, 3))
+         DO stateJ = 1, tidft_env%pp_m
+            DO ivar = 1, 3
+               IF (tidft_env%pp_ncols(ivar).NE.0) THEN
+                  CALL dbcsr_create(tidft_env%mat_pp_u(stateJ,ivar), template=gradient_out(nstates,ivar))
+                  CALL dbcsr_set(tidft_env%mat_pp_u(stateJ,ivar), 0.0_dp)
+               ENDIF
+            ENDDO ! ivar
+         ENDDO ! stateJ
+      ENDIF
+
       DO stateI = first_state, nstates
          DO idet = 1, ndets
             ! triplet_correction uses beta-gradient to correct alpha-gradient
@@ -2369,7 +2550,9 @@ CONTAINS
 
                            nmos_stateJ = tidft_env%e_states(stateJ)%slater_det(idet)%nelectrons_ab(ispin)
 
-                           IF ( nmos_stateJ .GT. 0) THEN
+                           ! aeph: 2a - the J = I term enters the self term below in closed form;
+                           ! aeph: mat_adj_sigma(I,I) is never read elsewhere
+                           IF ( nmos_stateJ .GT. 0 .AND. stateJ .NE. stateI) THEN
 
                               ! Compute ADJUGATE
                               IF (stateJ .GE. stateI) THEN
@@ -2431,39 +2614,69 @@ CONTAINS
                               ! This means compute for triplet_correction==.FALSE. .OR. idet.EQ.2
                               IF ( .NOT.(tidft_env%triplet_correction .AND. idet.EQ.1) ) THEN
 
-                                 IF (ispin .EQ. 1) THEN
-                                    opposite_spin = 2
-                                 ELSE
-                                    opposite_spin = 1
-                                 ENDIF
-                                 ! Weight of the pair term: the penalty part (Phi^-1)_JI plus
-                                 ! the multiplier part mu_J/SQRT(Phi_II*Phi_JJ), folded into the
-                                 ! overall factor -2*lambda_eff applied below
-                                 mult_pair_factor = 0.0_dp
-                                 IF (multiplier_term_on .AND. stateJ .LT. stateI) THEN
-                                    mult_pair_factor = tidft_env%overlap_multipliers(stateJ) / &
-                                       SQRT(tidft_env%mat_phi(stateI,stateI) * &
-                                            tidft_env%mat_phi(stateJ,stateJ)) / &
-                                       (-2.0_dp * lambda_eff)
-                                 ENDIF
-                                 CALL dbcsr_scale(tempOO2, &
-                                         tidft_env%mat_phi_spin(stateJ,stateI,opposite_spin) * &
-                                         (tidft_env%mat_phi_inv(stateJ,stateI) + mult_pair_factor) )
+                                 ! aeph: factor of the other spin; RKS (nspins = 1) has
+                                 ! aeph: Phi_IJ = det(sigma_IJ)**2 and gradVAR supplies the factor 2
+                                 opposite_spin = 3 - ispin
+                                 IF (nspins .EQ. 1) opposite_spin = 1
 
-                                 ! S.T_Jindex
+                                 ! S.T_Jindex (J /= I)
                                  ! RZK-WARNING: optimize N^2 re-evaluations to N
                                  CALL dbcsr_create(tempNO2, &
                                          template=tidft_env%e_states(stateJ)%slater_det(idet)%mat_t(ispin))
-                                 not_evaluated = .NOT. intrastate_penalty_component
-                                 IF (stateI.NE.stateJ .OR. not_evaluated) THEN
-                                    CALL dbcsr_multiply("N", "N", 1.0_dp, &
-                                            tidft_env%mat_s, &
-                                            tidft_env%e_states(stateJ)%slater_det(idet)%mat_t(ispin), &
-                                            0.0_dp, tempNO2, &
-                                            filter_eps=tidft_env%eps_filter)
-                                 ELSE
-                                    CALL dbcsr_copy(tempNO2,ST)
+                                 CALL dbcsr_multiply("N", "N", 1.0_dp, &
+                                         tidft_env%mat_s, &
+                                         tidft_env%e_states(stateJ)%slater_det(idet)%mat_t(ispin), &
+                                         0.0_dp, tempNO2, &
+                                         filter_eps=tidft_env%eps_filter)
+
+                                 ! aeph: 2b - constraint gradient u_J = dg_IJ/dT_I (J < I, this spin):
+                                 ! aeph: Phi^opp_IJ/SQRT(Phi_II*Phi_JJ) * S.T_J.adj(sigma_IJ) - g_IJ * S.T_I.sigma_II^-1,
+                                 ! aeph: mapped to the variables and summed over spins in mat_pp_u(J,:)
+                                 IF (pp_capture_now .AND. stateI .EQ. nstates .AND. stateJ .LT. stateI) THEN
+                                    pp_coef = 1.0_dp/SQRT(tidft_env%mat_phi(stateI,stateI)* &
+                                                          tidft_env%mat_phi(stateJ,stateJ))
+                                    pp_s = tidft_env%mat_phi(stateI,stateJ)*pp_coef
+                                    pp_coef = tidft_env%mat_phi_spin(stateJ,stateI,opposite_spin)*pp_coef
+                                    CALL dbcsr_create(pp_x, template=mat_g_inter(stateI, ispin))
+                                    CALL dbcsr_multiply("N", "N", pp_coef, tempNO2, tempOO2, &
+                                            0.0_dp, pp_x, filter_eps=tidft_env%eps_filter)
+                                    CALL dbcsr_add(pp_x, STsiginv, 1.0_dp, -pp_s)
+                                    DO ivar = 1, 3
+                                       IF (tidft_env%e_states(stateI)%slater_det(1)%ncols_var(ivar).NE.0) THEN
+                                          CALL dbcsr_create(gradient_temp(ivar), template=gradient_out(stateI,ivar))
+                                          CALL dbcsr_set(gradient_temp(ivar), 0.0_dp)
+                                       ENDIF
+                                    ENDDO ! ivar
+                                    CALL gradVAR_scale_split_increment( &
+                                            mat_g_out=gradient_temp(:), &
+                                            ncols_var=tidft_env%e_states(stateI)%slater_det(1)%ncols_var, &
+                                            mat_g_in=pp_x, &
+                                            mat_s=tidft_env%mat_s, &
+                                            idet=idet, &
+                                            ispin=ispin, &
+                                            nspins=nspins, &
+                                            triplet_correction=tidft_env%triplet_correction, &
+                                            energy_term=.FALSE.)
+                                    DO ivar = 1, 3
+                                       IF (tidft_env%e_states(stateI)%slater_det(1)%ncols_var(ivar).NE.0) THEN
+                                          CALL dbcsr_add(tidft_env%mat_pp_u(stateJ,ivar), &
+                                                  gradient_temp(ivar), 1.0_dp, 1.0_dp)
+                                          CALL dbcsr_release(gradient_temp(ivar))
+                                       ENDIF
+                                    ENDDO ! ivar
+                                    CALL dbcsr_release(pp_x)
                                  ENDIF
+
+                                 ! aeph: 2a - pair weight at its final scale (no later rescaling of a
+                                 ! aeph: filtered sum): -2*lambda_eff*(Phi^-1)_JI + mu_J/SQRT(Phi_II*Phi_JJ)
+                                 pair_weight = -2.0_dp*lambda_eff*tidft_env%mat_phi_inv(stateJ,stateI)
+                                 IF (multiplier_term_on .AND. stateJ .LT. stateI) THEN
+                                    pair_weight = pair_weight + tidft_env%overlap_multipliers(stateJ) / &
+                                       SQRT(tidft_env%mat_phi(stateI,stateI) * &
+                                            tidft_env%mat_phi(stateJ,stateJ))
+                                 ENDIF
+                                 CALL dbcsr_scale(tempOO2, &
+                                         tidft_env%mat_phi_spin(stateJ,stateI,opposite_spin)*pair_weight)
 
                                  CALL dbcsr_multiply("N", "N", 1.0_dp, &
                                          tempNO2, &
@@ -2484,18 +2697,16 @@ CONTAINS
                      ! This means compute for triplet_correction==.FALSE. .OR. idet.EQ.2
                      IF ( .NOT.(tidft_env%triplet_correction .AND. idet.EQ.1) ) THEN
 
-                        ! Normalization term: 2*lambda from the penalty minus SUM_J mu_J*g_IJ
-                        ! from the multiplier term, folded into the factor -2*lambda_eff below
-                        mult_self_factor = 1.0_dp
-                        IF (multiplier_term_on) &
-                           mult_self_factor = 1.0_dp - multiplier_term/(2.0_dp*lambda_eff)
-                        CALL dbcsr_add(mat_g_inter(stateI, ispin), STsiginv, 1.0_dp, -mult_self_factor)
-                        ! aeph: original scaling kept for reference/testing
-                        !CALL dbcsr_scale(mat_g_inter(stateI, ispin), &
-                        !        -2.0_dp*tidft_env%interstate_nonorthogonality_penalty_coeff)
-                        ! aeph: scale by effective ALM multiplier (lambda_eff == lambda when augmented off)
-                        CALL dbcsr_scale(mat_g_inter(stateI, ispin), & 
-                                -2.0_dp*lambda_eff)
+                        ! aeph: 2a - J = I term plus normalization in closed form. With
+                        ! aeph: adj(sigma_II) = det(sigma_II)*sigma_II^-1 and Phi^opp_II*det(sigma_II) = Phi_II
+                        ! aeph: the self coefficient is -2*lambda_eff*(Phi_II*(Phi^-1)_II - 1) - SUM_J mu_J*g_IJ,
+                        ! aeph: computed from the small dense Phi instead of as a difference of two O(1)
+                        ! aeph: matrices; lambda_eff == lambda when augmented off
+                        self_weight = -2.0_dp*lambda_eff* &
+                                      (tidft_env%mat_phi(stateI,stateI)*tidft_env%mat_phi_inv(stateI,stateI) - 1.0_dp)
+                        IF (multiplier_term_on) self_weight = self_weight - multiplier_term
+                        CALL dbcsr_add(mat_g_inter(stateI, ispin), STsiginv, 1.0_dp, self_weight)
+                        ! aeph: no dbcsr_scale of mat_g_inter: every weight already carries -2*lambda_eff
 
                         DO ivar = 1, 3
                            IF (tidft_env%e_states(stateI)%slater_det(1)%ncols_var(ivar).NE.0) THEN
@@ -2545,6 +2756,14 @@ CONTAINS
          ENDDO ! idet
       ENDDO ! stateI
       DEALLOCATE(gradient_temp)
+
+      ! aeph: 2b - inverse Gauss-Newton weight of -lambda_eff*ln det(normalized Phi) in the
+      ! aeph: current-row overlaps g_IJ: W^-1 = (1-q)/(2 lambda_eff) [A - 2 g g^T/(1+q)],
+      ! aeph: A = normalized frozen block, 1-q = 1/(Phi_II*(Phi^-1)_II)
+      IF (pp_capture_now) THEN
+         CALL tidft_pp_set_winv(tidft_env, lambda_eff)
+         tidft_env%pp_have_u = .TRUE.
+      ENDIF
 
       ! CINDY: compute energy grad component norm
       E_grad_norm = 0.0_dp
@@ -3280,6 +3499,8 @@ CONTAINS
 
          IF (iteration .EQ. 0) THEN
             CALL tidft_compute_invert_preconditioner(tidft_env, precond, prec_inv)
+            ! aeph: 2b - Woodbury factors of the penalty Gauss-Newton term, built with P0
+            CALL tidft_pp_build(tidft_env, prec_inv)
          ENDIF
 
          CALL tidft_optimizer_mainvar_multiply_diff( &
@@ -3291,6 +3512,9 @@ CONTAINS
                  step, &
                  tidft_env%eps_filter, &
                  tidft_env%e_states(1)%slater_det(1)%ncols_var)
+
+         ! aeph: 2b - step = -(P0 + U W U^T)^-1 g = step0 - SUM_J a_J Y_J
+         IF (tidft_env%pp_ready) CALL tidft_pp_apply(tidft_env, grad, step)
 
       CASE (tidft_prec_s)
 
@@ -3444,6 +3668,257 @@ CONTAINS
 !tiidft      ENDIF ! second derivative type fork
 
    END SUBROUTINE tidft_optimizer_grad_to_step
+
+! **************************************************************************************************
+!> \brief 2b: releases the storage of the penalty preconditioner (u_J, Y_J, W^-1, C^-1)
+!> \param tidft_env ...
+!> \par History
+!>       2026.11 created [aeph]
+! **************************************************************************************************
+   SUBROUTINE tidft_pp_release(tidft_env)
+
+      TYPE(tidft_env_type), INTENT(INOUT)                :: tidft_env
+
+      INTEGER                                            :: ivar, j
+
+      IF (ALLOCATED(tidft_env%mat_pp_u)) THEN
+         DO j = 1, SIZE(tidft_env%mat_pp_u, 1)
+            DO ivar = 1, 3
+               IF (tidft_env%pp_ncols(ivar) .NE. 0) CALL dbcsr_release(tidft_env%mat_pp_u(j, ivar))
+            ENDDO
+         ENDDO
+         DEALLOCATE (tidft_env%mat_pp_u)
+      ENDIF
+      IF (ALLOCATED(tidft_env%mat_pp_y)) THEN
+         DO j = 1, SIZE(tidft_env%mat_pp_y, 1)
+            DO ivar = 1, 3
+               IF (tidft_env%pp_ncols(ivar) .NE. 0) CALL dbcsr_release(tidft_env%mat_pp_y(j, ivar))
+            ENDDO
+         ENDDO
+         DEALLOCATE (tidft_env%mat_pp_y)
+      ENDIF
+      IF (ALLOCATED(tidft_env%pp_winv)) DEALLOCATE (tidft_env%pp_winv)
+      IF (ALLOCATED(tidft_env%pp_cinv)) DEALLOCATE (tidft_env%pp_cinv)
+      tidft_env%pp_have_u = .FALSE.
+      tidft_env%pp_ready = .FALSE.
+
+   END SUBROUTINE tidft_pp_release
+
+! **************************************************************************************************
+!> \brief 2b: inverse Gauss-Newton weight of the interstate penalty -lambda*ln det(N) with respect
+!>        to the current-row normalized overlaps g_J = N_IJ (J < I), with the frozen block A = N_JK:
+!>        W = 2 lambda [A^-1/(1-q) + 2 A^-1 g g^T A^-1/(1-q)^2], q = g^T A^-1 g, so
+!>        W^-1 = (1-q)/(2 lambda) [A - 2 g g^T/(1+q)] and 1-q = 1/(Phi_II (Phi^-1)_II)
+!> \param tidft_env ...
+!> \param lambda effective penalty strength of the interstate term
+!> \par History
+!>       2026.11 created [aeph]
+! **************************************************************************************************
+   SUBROUTINE tidft_pp_set_winv(tidft_env, lambda)
+
+      TYPE(tidft_env_type), INTENT(INOUT)                :: tidft_env
+      REAL(KIND=dp), INTENT(IN)                          :: lambda
+
+      INTEGER                                            :: i, j, k, m
+      REAL(KIND=dp)                                      :: omq, q
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: g
+
+      m = tidft_env%pp_m
+      i = tidft_env%pp_state
+      IF (ALLOCATED(tidft_env%pp_winv)) DEALLOCATE (tidft_env%pp_winv)
+      ALLOCATE (tidft_env%pp_winv(m, m), g(m))
+
+      omq = 1.0_dp/(tidft_env%mat_phi(i, i)*tidft_env%mat_phi_inv(i, i))
+      q = 1.0_dp - omq
+      DO j = 1, m
+         g(j) = tidft_env%mat_phi(i, j)/SQRT(tidft_env%mat_phi(i, i)*tidft_env%mat_phi(j, j))
+      ENDDO
+      DO k = 1, m
+         DO j = 1, m
+            tidft_env%pp_winv(j, k) = omq/(2.0_dp*lambda)*( &
+                                      tidft_env%mat_phi(j, k)/SQRT(tidft_env%mat_phi(j, j)*tidft_env%mat_phi(k, k)) - &
+                                      2.0_dp*g(j)*g(k)/(1.0_dp + q))
+         ENDDO
+      ENDDO
+      tidft_env%pp_lambda = lambda
+      DEALLOCATE (g)
+
+   END SUBROUTINE tidft_pp_set_winv
+
+! **************************************************************************************************
+!> \brief 2b: at a preconditioner rebuild, Y_J = P0^-1 u_J and C^-1 = (W^-1 + U^T P0^-1 U)^-1.
+!>        Uses the u_J captured at the evaluation that preceded the rebuild; both are kept
+!>        unchanged until the next rebuild, so the preconditioner is fixed within an inner loop.
+!> \param tidft_env ...
+!> \param prec_inv P0^-1 (state, variable block)
+!> \par History
+!>       2026.11 created [aeph]
+! **************************************************************************************************
+   SUBROUTINE tidft_pp_build(tidft_env, prec_inv)
+
+      TYPE(tidft_env_type), INTENT(INOUT)                :: tidft_env
+      TYPE(dbcsr_type), DIMENSION(:, :), INTENT(INOUT)   :: prec_inv
+
+      INTEGER                                            :: i, ivar, j, k, m, unit_nr
+      LOGICAL                                            :: ok
+      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE        :: gmat
+      TYPE(cp_logger_type), POINTER                      :: logger
+
+      tidft_env%pp_ready = .FALSE.
+      IF (.NOT. tidft_env%pp_have_u) RETURN
+      tidft_env%pp_have_u = .FALSE.
+      i = tidft_env%pp_state
+      m = tidft_env%pp_m
+      IF (m .LT. 1 .OR. i .GT. SIZE(prec_inv, 1)) RETURN
+
+      logger => cp_get_default_logger()
+      IF (logger%para_env%mepos == logger%para_env%source) THEN
+         unit_nr = cp_logger_get_default_unit_nr(logger, local=.TRUE.)
+      ELSE
+         unit_nr = -1
+      ENDIF
+
+      ! Y_J = P0^-1 u_J (contravariant, like the step)
+      IF (ALLOCATED(tidft_env%mat_pp_y)) THEN
+         DO j = 1, SIZE(tidft_env%mat_pp_y, 1)
+            DO ivar = 1, 3
+               IF (tidft_env%pp_ncols(ivar) .NE. 0) CALL dbcsr_release(tidft_env%mat_pp_y(j, ivar))
+            ENDDO
+         ENDDO
+         DEALLOCATE (tidft_env%mat_pp_y)
+      ENDIF
+      ALLOCATE (tidft_env%mat_pp_y(m, 3))
+      DO j = 1, m
+         DO ivar = 1, 3
+            IF (tidft_env%pp_ncols(ivar) .NE. 0) &
+               CALL dbcsr_create(tidft_env%mat_pp_y(j, ivar), template=tidft_env%mat_pp_u(j, ivar))
+         ENDDO
+         CALL tidft_optimizer_mainvar_multiply_diff( &
+                 "N", "N", 1.0_dp, prec_inv(i:i, :), tidft_env%mat_pp_u(j:j, :), &
+                 0.0_dp, tidft_env%mat_pp_y(j:j, :), tidft_env%eps_filter, tidft_env%pp_ncols)
+      ENDDO
+
+      ! G_JK = <u_J, Y_K> (covariant x contravariant), symmetrized
+      ALLOCATE (gmat(m, m))
+      DO k = 1, m
+         DO j = 1, m
+            CALL tidft_optimizer_mainvar_dot( &
+                    mat_left=tidft_env%mat_pp_u(j:j, :), &
+                    mat_right=tidft_env%mat_pp_y(k:k, :), &
+                    mat_left_covariant=.TRUE., &
+                    mat_right_covariant=.FALSE., &
+                    dot_product=gmat(j, k), &
+                    ncols_var=tidft_env%pp_ncols)
+         ENDDO
+      ENDDO
+      gmat(:, :) = 0.5_dp*(gmat(:, :) + TRANSPOSE(gmat(:, :)))
+
+      IF (ALLOCATED(tidft_env%pp_cinv)) DEALLOCATE (tidft_env%pp_cinv)
+      ALLOCATE (tidft_env%pp_cinv(m, m))
+      tidft_env%pp_cinv(:, :) = tidft_env%pp_winv(:, :) + gmat(:, :)
+      CALL tidft_pp_spd_inverse(tidft_env%pp_cinv, m, ok)
+      tidft_env%pp_ready = ok
+
+      ! one line per rebuild: state, number of constraints, 2*lambda, and the range of
+      ! 2*lambda*<u_J, P0^-1 u_J> (how much stiffer than P0 the constraint directions are)
+      IF (unit_nr > 0) THEN
+         WRITE (unit_nr, '(T2,A19,2I5,3ES12.4,L3)') "PREC-PENALTY:", i, m, &
+            2.0_dp*tidft_env%pp_lambda, &
+            2.0_dp*tidft_env%pp_lambda*MINVAL((/(gmat(j, j), j=1, m)/)), &
+            2.0_dp*tidft_env%pp_lambda*MAXVAL((/(gmat(j, j), j=1, m)/)), ok
+      ENDIF
+      IF (.NOT. ok) THEN
+         CPWARN("PRECONDITIONER_PENALTY: W^-1 + U^T P0^-1 U not positive definite, correction skipped")
+      ENDIF
+      DEALLOCATE (gmat)
+
+   END SUBROUTINE tidft_pp_build
+
+! **************************************************************************************************
+!> \brief 2b: applies the Woodbury correction to the preconditioned step of the current state,
+!>        step = -(P0 + U W U^T)^-1 g = step0 - SUM_J a_J Y_J with a = C^-1 b and
+!>        b_J = <u_J, step0> = -<g, Y_J> (P0^-1 is symmetric)
+!> \param tidft_env ...
+!> \param grad gradient (covariant)
+!> \param step step0 = -P0^-1 g on input, corrected step on output
+!> \par History
+!>       2026.11 created [aeph]
+! **************************************************************************************************
+   SUBROUTINE tidft_pp_apply(tidft_env, grad, step)
+
+      TYPE(tidft_env_type), INTENT(INOUT)                :: tidft_env
+      TYPE(dbcsr_type), DIMENSION(:, :), INTENT(IN)      :: grad
+      TYPE(dbcsr_type), DIMENSION(:, :), INTENT(INOUT)   :: step
+
+      INTEGER                                            :: i, ivar, j, m
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: a, b
+
+      i = tidft_env%pp_state
+      m = tidft_env%pp_m
+      IF (i .GT. SIZE(grad, 1) .OR. i .GT. SIZE(step, 1)) RETURN
+
+      ALLOCATE (a(m), b(m))
+      DO j = 1, m
+         CALL tidft_optimizer_mainvar_dot( &
+                 mat_left=grad(i:i, :), &
+                 mat_right=tidft_env%mat_pp_y(j:j, :), &
+                 mat_left_covariant=.TRUE., &
+                 mat_right_covariant=.FALSE., &
+                 dot_product=b(j), &
+                 ncols_var=tidft_env%pp_ncols)
+         b(j) = -b(j)
+      ENDDO
+      a(:) = MATMUL(tidft_env%pp_cinv(:, :), b(:))
+      DO j = 1, m
+         DO ivar = 1, 3
+            IF (tidft_env%pp_ncols(ivar) .NE. 0) &
+               CALL dbcsr_add(step(i, ivar), tidft_env%mat_pp_y(j, ivar), 1.0_dp, -a(j))
+         ENDDO
+      ENDDO
+      DEALLOCATE (a, b)
+
+   END SUBROUTINE tidft_pp_apply
+
+! **************************************************************************************************
+!> \brief 2b: inverse of a small symmetric matrix by Cholesky; ok = .FALSE. (matrix unchanged
+!>        in meaning, not usable) if it is not positive definite
+!> \param a matrix, replaced by its inverse
+!> \param n size
+!> \param ok success
+!> \par History
+!>       2026.11 created [aeph]
+! **************************************************************************************************
+   SUBROUTINE tidft_pp_spd_inverse(a, n, ok)
+
+      INTEGER, INTENT(IN)                                :: n
+      REAL(KIND=dp), DIMENSION(n, n), INTENT(INOUT)      :: a
+      LOGICAL, INTENT(OUT)                               :: ok
+
+      INTEGER                                            :: i, j
+      REAL(KIND=dp)                                      :: s
+      REAL(KIND=dp), DIMENSION(n, n)                     :: el, elinv
+
+      ok = .FALSE.
+      el(:, :) = 0.0_dp
+      DO j = 1, n
+         s = a(j, j) - SUM(el(j, 1:j - 1)**2)
+         IF (s .LE. 0.0_dp) RETURN
+         el(j, j) = SQRT(s)
+         DO i = j + 1, n
+            el(i, j) = (a(i, j) - SUM(el(i, 1:j - 1)*el(j, 1:j - 1)))/el(j, j)
+         ENDDO
+      ENDDO
+      elinv(:, :) = 0.0_dp
+      DO j = 1, n
+         elinv(j, j) = 1.0_dp/el(j, j)
+         DO i = j + 1, n
+            elinv(i, j) = -SUM(el(i, j:i - 1)*elinv(j:i - 1, j))/el(i, i)
+         ENDDO
+      ENDDO
+      a(:, :) = MATMUL(TRANSPOSE(elinv), elinv)
+      ok = .TRUE.
+
+   END SUBROUTINE tidft_pp_spd_inverse
 
 ! **************************************************************************************************
 !> \brief Allocate temporary storage for an optimizer

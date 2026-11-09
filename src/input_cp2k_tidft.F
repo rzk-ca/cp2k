@@ -336,6 +336,20 @@ CONTAINS
          CALL section_add_keyword(section, keyword)
          CALL keyword_release(keyword)
 
+         ! aeph: 2b - interstate penalty curvature in the preconditioner
+         CALL keyword_create(keyword, __LOCATION__, name="PRECONDITIONER_PENALTY", &
+                     description="Add the Gauss-Newton term of the interstate penalty, "// &
+                     "2*lambda*SUM_JK W_JK u_J u_K^T with u_J the gradient of the normalized overlap "// &
+                     "of the current state with previous state J, to the preconditioner by a "// &
+                     "low-rank (Woodbury) correction. The vectors are taken when the preconditioner "// &
+                     "is rebuilt (first iteration of each outer loop). Active only with STATE_BY_STATE, "// &
+                     "the interstate component, analytic gradients and the H_S, QHQ_S or QHQ_QSQ "// &
+                     "preconditioners.", &
+                     usage="PRECONDITIONER_PENALTY .TRUE.", default_l_val=.FALSE., &
+                     lone_keyword_l_val=.TRUE.)
+         CALL section_add_keyword(section, keyword)
+         CALL keyword_release(keyword)
+
          CALL keyword_create(keyword, __LOCATION__, name="MAX_ITER_OUTER_LOOP", &
                              description="Maximum number of iterations in the outer loop. "// &
                              "Use the outer loop to update the preconditioner and reset the conjugator. "// &
@@ -568,10 +582,13 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_CURVATURE_SHIFT", &
                           description="Used with MULTIPLIER_COMPONENT. Estimated excitation energy "// &
                           "(Hartree) of the current state above the ground state. The dual step "// &
-                          "uses 2*(lambda - shift) instead of 2*lambda, which is exact for the "// &
-                          "two-level model of the collapse. Zero gives the plain multiplier update. "// &
-                          "Must not be negative. If lambda - shift is not positive, a warning is "// &
-                          "printed and 2*lambda is used. Ignored with MULTIPLIER_CURVATURE_AUTO.", &
+                          "uses 2*(lambda - shift) instead of 2*lambda, where lambda is "// &
+                          "INTERSTATE_NON_PENALTY_STRENGTH as grown by the safeguard. This is exact "// &
+                          "in the two-level model for collapse onto the ground state; for a pair "// &
+                          "with an excited state J the two-level curvature is E_I - E_J. Zero gives "// &
+                          "the plain multiplier update. Must not be negative. If lambda - shift is "// &
+                          "not positive, a warning is printed and 2*lambda is used. Ignored with "// &
+                          "MULTIPLIER_CURVATURE_AUTO.", &
                           usage="MULTIPLIER_CURVATURE_SHIFT 0.0", &
                           default_r_val=0.0_dp)
       CALL section_add_keyword(section, keyword)
@@ -595,9 +612,26 @@ CONTAINS
                           "convergence criterion of the next inner optimization is set to this "// &
                           "fraction of the current-row residual, but never looser than the previous "// &
                           "criterion and never tighter than EPS_ERROR. Zero means every inner "// &
-                          "optimization is converged to EPS_ERROR.", &
+                          "optimization is converged to EPS_ERROR. The first inner optimization "// &
+                          "is loose (LOOSE_EPS_SCF) only when NSTEPS_STRENGTH > 1.", &
                           usage="MULTIPLIER_INNER_TOL_FACTOR 0.1", &
                           default_r_val=0.1_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      ! aeph: 3 - quasi-Newton dual step
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_QUASI_NEWTON", &
+                          description="Used with MULTIPLIER_COMPONENT. Replace the fixed dual step "// &
+                          "2*(lambda - shift) by a quasi-Newton step mu <- mu + H y, H = 2*lambda*I + K, "// &
+                          "with K learned per state by a type-II Broyden update from successive "// &
+                          "outer iterations (secant in nu = mu + 2*lambda*y, so K carries over when "// &
+                          "lambda grows). The first step equals the fixed step. An update is accepted "// &
+                          "only if the symmetric part of H - lambda*I stays positive definite. "// &
+                          "If the residual rises after a step, the multipliers go back halfway; "// &
+                          "lambda grows if that fails too, or after three consecutive updates "// &
+                          "that miss MULTIPLIER_SAFEGUARD_RATIO.", &
+                          usage="MULTIPLIER_QUASI_NEWTON .TRUE.", default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 

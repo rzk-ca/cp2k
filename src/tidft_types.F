@@ -200,6 +200,21 @@ MODULE tidft_types
       LOGICAL                                            :: multiplier_curvature_auto = .FALSE.
       LOGICAL                                            :: multiplier_capture_de = .FALSE.
       REAL(KIND=dp)                                      :: multiplier_delta_e = 0.0_dp
+      ! aeph: 3 - MULTIPLIER_QUASI_NEWTON: Broyden dual step mu <- mu + H y, H = 2 C_P I + K
+      LOGICAL                                            :: multiplier_quasi_newton = .FALSE.
+      ! aeph: 2b - Gauss-Newton term of the interstate penalty in the PCG preconditioner
+      ! aeph: (Woodbury, TIDFT_OPTIMIZER_PCG%PRECONDITIONER_PENALTY). u_J = dg_IJ/dvar (J < I) are
+      ! aeph: captured at the evaluation preceding a preconditioner rebuild; Y_J = P0^-1 u_J and
+      ! aeph: C^-1 = (W^-1 + U^T Y)^-1 are built with P0 and kept until the next rebuild
+      LOGICAL                                            :: prec_penalty = .FALSE.
+      LOGICAL                                            :: pp_capture = .FALSE., &
+                                                            pp_have_u = .FALSE., &
+                                                            pp_ready = .FALSE.
+      INTEGER                                            :: pp_m = 0, pp_state = 0
+      INTEGER, DIMENSION(3)                              :: pp_ncols = 0
+      REAL(KIND=dp)                                      :: pp_lambda = 0.0_dp
+      TYPE(dbcsr_type), DIMENSION(:,:), ALLOCATABLE      :: mat_pp_u, mat_pp_y
+      REAL(KIND=dp), DIMENSION(:,:), ALLOCATABLE         :: pp_winv, pp_cinv
       ! inner tolerance for the next solve = this fraction of the current residual
       ! (never looser than the previous solve, never tighter than EPS_ERROR)
       REAL(KIND=dp)                                      :: multiplier_inner_tol_factor

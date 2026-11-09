@@ -245,6 +245,13 @@ CONTAINS
       ! CINDY 
       CALL section_vals_val_get(tidft_pcg_optimizer_section, "PREC_WEIGHT_OVERLAP", &
                                 r_val=tidft_env%weight_alpha_prec)
+      ! aeph: 2b - Gauss-Newton interstate penalty term in the preconditioner
+      CALL section_vals_val_get(tidft_pcg_optimizer_section, "PRECONDITIONER_PENALTY", &
+                                l_val=tidft_env%prec_penalty)
+      IF (tidft_env%prec_penalty .AND. &
+          (tidft_env%numerical_gradient .OR. .NOT. tidft_env%state_by_state)) THEN
+         CPWARN("PRECONDITIONER_PENALTY is inactive with NUMERICAL_GRADIENT or without STATE_BY_STATE")
+      ENDIF
 
       penalty_section => section_vals_get_subs_vals(tidft_section, "PENALTY")
 
@@ -295,17 +302,34 @@ CONTAINS
       CALL section_vals_val_get(penalty_section, &
                                 "MULTIPLIER_CURVATURE_SHIFT", &
                                 r_val=tidft_env%multiplier_curvature_shift)
-      ! aeph: a negative shift would enlarge the dual step
-      IF (tidft_env%multiplier_curvature_shift .LT. 0.0_dp) THEN
-         CPABORT("MULTIPLIER_CURVATURE_SHIFT must be >= 0")
-      ENDIF
       ! aeph: automatic shift = Delta E of the starting MOs of each excited state
       CALL section_vals_val_get(penalty_section, &
                                 "MULTIPLIER_CURVATURE_AUTO", &
                                 l_val=tidft_env%multiplier_curvature_auto)
-      IF (tidft_env%multiplier_curvature_auto .AND. &
-          tidft_env%multiplier_curvature_shift .GT. 0.0_dp) THEN
-         CPWARN("MULTIPLIER_CURVATURE_SHIFT is ignored with MULTIPLIER_CURVATURE_AUTO")
+      ! aeph: 3 - quasi-Newton (Broyden) dual step
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_QUASI_NEWTON", &
+                                l_val=tidft_env%multiplier_quasi_newton)
+      ! aeph: the multiplier settings are checked only when the multiplier term is used
+      IF (tidft_env%multiplier_component) THEN
+         ! aeph: a negative shift would enlarge the dual step
+         IF (tidft_env%multiplier_curvature_shift .LT. 0.0_dp) THEN
+            CPABORT("MULTIPLIER_CURVATURE_SHIFT must be >= 0")
+         ENDIF
+         IF (tidft_env%multiplier_curvature_auto .AND. &
+             tidft_env%multiplier_curvature_shift .GT. 0.0_dp) THEN
+            CPWARN("MULTIPLIER_CURVATURE_SHIFT is ignored with MULTIPLIER_CURVATURE_AUTO")
+         ENDIF
+         ! aeph: the safeguard multiplies C_P by |factor|; below 1 it would shrink C_P (0 -> 0/0)
+         IF (ABS(tidft_env%penalty_strength_inc_factor) .LT. 1.0_dp) THEN
+            CPABORT("MULTIPLIER_COMPONENT requires |PENALTY_STRENGTH_INCREASE_FACTOR| >= 1")
+         ENDIF
+         IF (.NOT. tidft_env%loss_function_components(1)) THEN
+            CPWARN("MULTIPLIER_COMPONENT makes no dual updates with ENERGY_COMPONENT=.FALSE.")
+         ENDIF
+      ELSE IF (tidft_env%multiplier_curvature_auto .OR. tidft_env%multiplier_quasi_newton .OR. &
+               tidft_env%multiplier_curvature_shift .NE. 0.0_dp) THEN
+         CPWARN("MULTIPLIER_CURVATURE_*/MULTIPLIER_QUASI_NEWTON are ignored without MULTIPLIER_COMPONENT")
       ENDIF
       CALL section_vals_val_get(penalty_section, &
                                 "MULTIPLIER_INNER_TOL_FACTOR", &
