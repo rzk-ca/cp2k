@@ -200,8 +200,11 @@ MODULE tidft_types
       LOGICAL                                            :: multiplier_curvature_auto = .FALSE.
       LOGICAL                                            :: multiplier_capture_de = .FALSE.
       REAL(KIND=dp)                                      :: multiplier_delta_e = 0.0_dp
-      ! aeph: 3 - MULTIPLIER_QUASI_NEWTON: Broyden dual step mu <- mu + H y, H = 2 C_P I + K
-      LOGICAL                                            :: multiplier_quasi_newton = .FALSE.
+      ! aeph: MULTIPLIER_SECANT: per-constraint secant dual step mu_J <- nu_J + K_J y_J, with K_J
+      ! aeph: from nu = mu + 2 C_P y = mu* - K y over the last two updates (C_P independent);
+      ! aeph: the extrapolation beyond the fixed step is limited to MULTIPLIER_SECANT_TRUST*|dnu_J|
+      LOGICAL                                            :: multiplier_secant = .FALSE.
+      REAL(KIND=dp)                                      :: multiplier_secant_trust = 4.0_dp
       ! aeph: 2b - Gauss-Newton term of the interstate penalty in the PCG preconditioner
       ! aeph: (Woodbury, TIDFT_OPTIMIZER_PCG%PRECONDITIONER_PENALTY). u_J = dg_IJ/dvar (J < I) are
       ! aeph: captured at the evaluation preceding a preconditioner rebuild; Y_J = P0^-1 u_J and
@@ -228,6 +231,24 @@ MODULE tidft_types
       ! last dual update; used to detect a sign (gauge) flip of the orbitals
       TYPE(dbcsr_type), DIMENSION(:), ALLOCATABLE        :: mat_t_gauge_ref
       LOGICAL                                            :: gauge_ref_set = .FALSE.
+      ! Selective signed-cosine term for pairs whose guesses differ in r >= 2
+      ! orbitals. Added on top of mu_J * g_IJ. c_k is the signed principal cosine.
+      LOGICAL                                            :: cosine_on_doubles = .FALSE.
+      INTEGER, DIMENSION(:,:), ALLOCATABLE               :: guess_nocc
+      INTEGER, DIMENSION(:,:,:), ALLOCATABLE             :: guess_occ
+      INTEGER, DIMENSION(:,:,:), ALLOCATABLE             :: cosine_rank
+      ! number of penalized cosines per block, fixed between dual updates;
+      ! <= 0 means "choose at the next evaluation", -m_prev keeps the previous choice
+      INTEGER, DIMENSION(:,:,:), ALLOCATABLE             :: cosine_m
+      REAL(KIND=dp), DIMENSION(:,:,:), ALLOCATABLE       :: cosine_mu
+      REAL(KIND=dp), DIMENSION(:,:,:), ALLOCATABLE       :: cosine_dev
+      REAL(KIND=dp), DIMENSION(:,:,:,:), ALLOCATABLE     :: cosine_lambda
+      REAL(KIND=dp), DIMENSION(:,:,:,:), ALLOCATABLE     :: cosine_c
+      REAL(KIND=dp), DIMENSION(:,:,:,:), ALLOCATABLE     :: cosine_W
+      REAL(KIND=dp), DIMENSION(:,:,:), ALLOCATABLE       :: cosine_q
+      REAL(KIND=dp), DIMENSION(:,:,:,:), ALLOCATABLE     :: cosine_u
+      REAL(KIND=dp), DIMENSION(:,:,:,:), ALLOCATABLE     :: cosine_v
+      LOGICAL, DIMENSION(:,:,:), ALLOCATABLE             :: cosine_have_vec
 
       ! dipole evaluation
       INTEGER                                            :: dipole_reference_type

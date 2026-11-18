@@ -505,6 +505,8 @@ CONTAINS
 
       ENDDO ! istate
 
+      CALL store_guess_occupations(tidft_env, excitation_list, index_true, generated_nstates)
+
       ! MAJOR STEP: Clean up
       DEALLOCATE(index_true)
       DEALLOCATE(energies_temp)
@@ -1376,6 +1378,79 @@ CONTAINS
          ENDDO ! ispin
 
    END SUBROUTINE PairedUnpaired
+
+! **************************************************************************************************
+!> \brief Store canonical-guess occupation IDs. GS occupied columns are 1..nocc;
+!>        a promotion replaces occupied(k) by nocc+virtual(k). Cosine rank r
+!>        is the number of IDs in one state that are not in the other.
+! **************************************************************************************************
+   SUBROUTINE store_guess_occupations(tidft_env, excitation_list, index_true, generated_nstates)
+
+      TYPE(tidft_env_type), INTENT(INOUT)                :: tidft_env
+      TYPE(tidft_excitation_list_type), INTENT(IN)       :: excitation_list
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: index_true
+      INTEGER, INTENT(IN)                                :: generated_nstates
+
+      INTEGER                                            :: estate, i, idet, iorder, ispin, istate, &
+                                                            max_occ, n, n_full, nocc, nspins, &
+                                                            occ_col, state_index, vir_col
+      LOGICAL                                            :: found
+
+      n_full = SIZE(tidft_env%e_states)
+      nspins = tidft_env%nspins
+      idet = 1
+      IF (tidft_env%triplet_correction) idet = 2
+      max_occ = 0
+      DO estate = 1, n_full
+         DO ispin = 1, nspins
+            max_occ = MAX(max_occ, &
+               tidft_env%e_states(estate)%slater_det(idet)%nelectrons_ab(ispin))
+         ENDDO
+      ENDDO
+      IF (max_occ .LT. 1) max_occ = 1
+
+      IF (ALLOCATED(tidft_env%guess_nocc)) DEALLOCATE(tidft_env%guess_nocc)
+      IF (ALLOCATED(tidft_env%guess_occ)) DEALLOCATE(tidft_env%guess_occ)
+      ALLOCATE(tidft_env%guess_nocc(n_full, nspins))
+      ALLOCATE(tidft_env%guess_occ(n_full, nspins, max_occ))
+      tidft_env%guess_nocc(:,:) = 0
+      tidft_env%guess_occ(:,:,:) = -1
+
+      DO ispin = 1, nspins
+         n = tidft_env%e_states(1)%slater_det(idet)%nelectrons_ab(ispin)
+         tidft_env%guess_nocc(1, ispin) = n
+         DO i = 1, n
+            tidft_env%guess_occ(1, ispin, i) = i
+         ENDDO
+      ENDDO
+
+      DO istate = 1, generated_nstates
+         estate = istate + 1
+         IF (estate .GT. n_full) CYCLE
+         state_index = index_true(istate)
+         DO ispin = 1, nspins
+            n = tidft_env%guess_nocc(1, ispin)
+            tidft_env%guess_nocc(estate, ispin) = n
+            tidft_env%guess_occ(estate, ispin, 1:n) = tidft_env%guess_occ(1, ispin, 1:n)
+         ENDDO
+         DO iorder = 1, excitation_list%excitations(state_index)%order
+            ispin = excitation_list%excitations(state_index)%spin(iorder)
+            occ_col = excitation_list%excitations(state_index)%occupied(iorder)
+            vir_col = excitation_list%excitations(state_index)%virtual(iorder)
+            nocc = tidft_env%guess_nocc(1, ispin)
+            found = .FALSE.
+            DO i = 1, nocc
+               IF (tidft_env%guess_occ(estate, ispin, i) .EQ. occ_col) THEN
+                  tidft_env%guess_occ(estate, ispin, i) = nocc + vir_col
+                  found = .TRUE.
+                  EXIT
+               ENDIF
+            ENDDO
+            IF (.NOT. found) CPABORT("Guess occupation replace missed occupied column")
+         ENDDO
+      ENDDO
+
+   END SUBROUTINE store_guess_occupations
 
 END MODULE tidft_guess_methods
 

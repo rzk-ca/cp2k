@@ -588,7 +588,8 @@ CONTAINS
                           "with an excited state J the two-level curvature is E_I - E_J. Zero gives "// &
                           "the plain multiplier update. Must not be negative. If lambda - shift is "// &
                           "not positive, a warning is printed and 2*lambda is used. Ignored with "// &
-                          "MULTIPLIER_CURVATURE_AUTO.", &
+                          "MULTIPLIER_CURVATURE_AUTO. With MULTIPLIER_SECANT the shift sets the "// &
+                          "prior dual curvature K0 = -2*shift used until a secant is measured.", &
                           usage="MULTIPLIER_CURVATURE_SHIFT 0.0", &
                           default_r_val=0.0_dp)
       CALL section_add_keyword(section, keyword)
@@ -619,18 +620,42 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
-      ! aeph: 3 - quasi-Newton dual step
-      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_QUASI_NEWTON", &
+      ! aeph: secant dual step
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_SECANT", &
                           description="Used with MULTIPLIER_COMPONENT. Replace the fixed dual step "// &
-                          "2*(lambda - shift) by a quasi-Newton step mu <- mu + H y, H = 2*lambda*I + K, "// &
-                          "with K learned per state by a type-II Broyden update from successive "// &
-                          "outer iterations (secant in nu = mu + 2*lambda*y, so K carries over when "// &
-                          "lambda grows). The first step equals the fixed step. An update is accepted "// &
-                          "only if the symmetric part of H - lambda*I stays positive definite. "// &
-                          "If the residual rises after a step, the multipliers go back halfway; "// &
-                          "lambda grows if that fails too, or after three consecutive updates "// &
-                          "that miss MULTIPLIER_SAFEGUARD_RATIO.", &
-                          usage="MULTIPLIER_QUASI_NEWTON .TRUE.", default_l_val=.FALSE., &
+                          "mu_J <- mu_J + 2*(lambda - shift)*y_J by a per-constraint secant step. With "// &
+                          "nu_J = mu_J + 2*lambda*y_J the linear dual model is nu_J = mu*_J - K_J*y_J, "// &
+                          "independent of lambda; K_J is measured from the last two outer iterations "// &
+                          "and the step is mu_J <- nu_J + K_J*y_J. Until K_J is measured (first update, "// &
+                          "small or noisy changes of y_J) K_J = -2*shift, i.e. the fixed step. The "// &
+                          "extrapolation beyond the fixed step is limited by MULTIPLIER_SECANT_TRUST. "// &
+                          "lambda grows only if the residual rises, if K_J <= -lambda for the largest "// &
+                          "overlap (penalty below the convexity threshold), or if the residual misses "// &
+                          "MULTIPLIER_SAFEGUARD_RATIO after a full secant step or without a measurable "// &
+                          "secant.", &
+                          usage="MULTIPLIER_SECANT .TRUE.", default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_SECANT_TRUST", &
+                          description="Used with MULTIPLIER_SECANT. The part of the secant step beyond "// &
+                          "the fixed step, |(K_J - K0)*y_J|, is limited to this multiple of the change "// &
+                          "of nu_J between the last two outer iterations. Must be positive.", &
+                          usage="MULTIPLIER_SECANT_TRUST 4.0", &
+                          default_r_val=4.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="COSINE_ON_DOUBLES", &
+                          description="Used with MULTIPLIER_COMPONENT. For a spin block whose "// &
+                          "canonical guesses differ in r >= 2 orbitals, add lambda_k*c_k + "// &
+                          "(mu/2)*c_k^2 on each of the r smallest signed principal cosines, "// &
+                          "on top of the signed overlap multipliers. Pairs with r < 2 are "// &
+                          "unchanged. mu starts at INTERSTATE_NON_PENALTY_STRENGTH and doubles "// &
+                          "only when the largest |c_k| of that block misses "// &
+                          "MULTIPLIER_SAFEGUARD_RATIO. The state is still accepted on max|g_IJ|.", &
+                          usage="COSINE_ON_DOUBLES .TRUE.", default_l_val=.FALSE., &
                           lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
