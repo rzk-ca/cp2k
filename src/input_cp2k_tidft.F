@@ -344,7 +344,8 @@ CONTAINS
                      "low-rank (Woodbury) correction. The vectors are taken when the preconditioner "// &
                      "is rebuilt (first iteration of each outer loop). Active only with STATE_BY_STATE, "// &
                      "the interstate component, analytic gradients and the H_S, QHQ_S or QHQ_QSQ "// &
-                     "preconditioners.", &
+                     "preconditioners. Ignored: it is on exactly when MULTIPLIER_COMPONENT and "// &
+                     "PENALTY%COSINE_ON_DOUBLES are both TRUE.", &
                      usage="PRECONDITIONER_PENALTY .TRUE.", default_l_val=.FALSE., &
                      lone_keyword_l_val=.TRUE.)
          CALL section_add_keyword(section, keyword)
@@ -648,9 +649,11 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="COSINE_ON_DOUBLES", &
-                          description="Used with MULTIPLIER_COMPONENT. For a spin block whose "// &
+                          description="Used with MULTIPLIER_COMPONENT (AL_COS method; also switches "// &
+                          "on PRECONDITIONER_PENALTY). For a spin block whose "// &
                           "canonical guesses differ in r >= 2 orbitals, add lambda_k*c_k + "// &
-                          "(mu/2)*c_k^2 on each of the r smallest signed principal cosines, "// &
+                          "(mu/2)*c_k^2 on the smallest signed principal cosine (the two smallest "// &
+                          "for a true double: c_2 < 2*c_1 + 2E-4, from the second outer iteration), "// &
                           "on top of the signed overlap multipliers. Pairs with r < 2 are "// &
                           "unchanged. mu starts at INTERSTATE_NON_PENALTY_STRENGTH and doubles "// &
                           "only when the largest |c_k| of that block misses "// &

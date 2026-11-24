@@ -119,7 +119,7 @@ CONTAINS
                                                             jj, GS_multips, nmultips 
       INTEGER, DIMENSION(:), POINTER                     :: tmplist
       INTEGER, DIMENSION(:), ALLOCATABLE                 :: nstates
-      LOGICAL                                            :: explicit
+      LOGICAL                                            :: explicit, l_in
       TYPE(section_vals_type), POINTER                   :: tidft_pcg_optimizer_section, &
                                                             tidft_section, &
                                                             penalty_section, WF_guess_section
@@ -167,7 +167,8 @@ CONTAINS
           .NOT. tidft_env%loss_function_components(3)) THEN
          CPABORT("AUGMENTED_COMPONENT requires INTERSTATE_COMPONENT=.TRUE.")
       ENDIF
-      ! signed-overlap multiplier term (component 5)
+      ! signed-overlap multiplier term (component 5). MULTIPLIER_COMPONENT selects the method:
+      ! FALSE = original penalty, TRUE = multipliers (AL_RZK), + COSINE_ON_DOUBLES = AL_COS
       CALL section_vals_val_get(tidft_section, &
               "MULTIPLIER_COMPONENT", &
               l_val=tidft_env%multiplier_component)
@@ -246,8 +247,12 @@ CONTAINS
       CALL section_vals_val_get(tidft_pcg_optimizer_section, "PREC_WEIGHT_OVERLAP", &
                                 r_val=tidft_env%weight_alpha_prec)
       ! aeph: 2b - Gauss-Newton interstate penalty term in the preconditioner
-      CALL section_vals_val_get(tidft_pcg_optimizer_section, "PRECONDITIONER_PENALTY", &
-                                l_val=tidft_env%prec_penalty)
+      ! on only in the AL_COS method (MULTIPLIER_COMPONENT and PENALTY%COSINE_ON_DOUBLES)
+      CALL section_vals_val_get(tidft_pcg_optimizer_section, "PRECONDITIONER_PENALTY", l_val=l_in)
+      CALL section_vals_val_get(tidft_section, "PENALTY%COSINE_ON_DOUBLES", l_val=tidft_env%prec_penalty)
+      tidft_env%prec_penalty = tidft_env%prec_penalty .AND. tidft_env%multiplier_component
+      IF (l_in .NEQV. tidft_env%prec_penalty) &
+         CPWARN("PRECONDITIONER_PENALTY is ignored: MULTIPLIER_COMPONENT and COSINE_ON_DOUBLES set it")
       IF (tidft_env%prec_penalty .AND. &
           (tidft_env%numerical_gradient .OR. .NOT. tidft_env%state_by_state)) THEN
          CPWARN("PRECONDITIONER_PENALTY is inactive with NUMERICAL_GRADIENT or without STATE_BY_STATE")
