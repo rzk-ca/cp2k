@@ -336,6 +336,21 @@ CONTAINS
          CALL section_add_keyword(section, keyword)
          CALL keyword_release(keyword)
 
+         ! aeph: 2b - interstate penalty curvature in the preconditioner
+         CALL keyword_create(keyword, __LOCATION__, name="PRECONDITIONER_PENALTY", &
+                     description="Add the Gauss-Newton term of the interstate penalty, "// &
+                     "2*lambda*SUM_JK W_JK u_J u_K^T with u_J the gradient of the normalized overlap "// &
+                     "of the current state with previous state J, to the preconditioner by a "// &
+                     "low-rank (Woodbury) correction. The vectors are taken when the preconditioner "// &
+                     "is rebuilt (first iteration of each outer loop). Active only with STATE_BY_STATE, "// &
+                     "the interstate component, analytic gradients and the H_S, QHQ_S or QHQ_QSQ "// &
+                     "preconditioners. Ignored: it is on exactly when MULTIPLIER_COMPONENT and "// &
+                     "PENALTY%COSINE_ON_DOUBLES are both TRUE.", &
+                     usage="PRECONDITIONER_PENALTY .TRUE.", default_l_val=.FALSE., &
+                     lone_keyword_l_val=.TRUE.)
+         CALL section_add_keyword(section, keyword)
+         CALL keyword_release(keyword)
+
          CALL keyword_create(keyword, __LOCATION__, name="MAX_ITER_OUTER_LOOP", &
                              description="Maximum number of iterations in the outer loop. "// &
                              "Use the outer loop to update the preconditioner and reset the conjugator. "// &
@@ -568,10 +583,29 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_CURVATURE_SHIFT", &
                           description="Used with MULTIPLIER_COMPONENT. Estimated excitation energy "// &
                           "(Hartree) of the current state above the ground state. The dual step "// &
-                          "uses 2*(lambda - shift) instead of 2*lambda, which is exact for the "// &
-                          "two-level model of the collapse. Zero gives the plain multiplier update.", &
+                          "uses 2*(lambda - shift) instead of 2*lambda, where lambda is "// &
+                          "INTERSTATE_NON_PENALTY_STRENGTH as grown by the safeguard. This is exact "// &
+                          "in the two-level model for collapse onto the ground state; for a pair "// &
+                          "with an excited state J the two-level curvature is E_I - E_J. Zero gives "// &
+                          "the plain multiplier update. Must not be negative. If lambda - shift is "// &
+                          "not positive, a warning is printed and 2*lambda is used. Ignored with "// &
+                          "MULTIPLIER_CURVATURE_AUTO. With MULTIPLIER_SECANT the shift sets the "// &
+                          "prior dual curvature K0 = -2*shift used until a secant is measured.", &
                           usage="MULTIPLIER_CURVATURE_SHIFT 0.0", &
                           default_r_val=0.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      ! aeph: automatic curvature shift from the excitation energy of the starting MOs
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_CURVATURE_AUTO", &
+                          description="Used with MULTIPLIER_COMPONENT. Use as the curvature shift the "// &
+                          "excitation energy Delta E = E_I - E_ground (Hartree) of the starting orbitals "// &
+                          "of each excited state I, taken at its first energy evaluation, so that the "// &
+                          "dual step uses 2*(lambda - Delta E). MULTIPLIER_CURVATURE_SHIFT is ignored. "// &
+                          "If Delta E or lambda - Delta E is not positive, a warning is printed and the "// &
+                          "plain step 2*lambda is used.", &
+                          usage="MULTIPLIER_CURVATURE_AUTO .TRUE.", default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -580,9 +614,52 @@ CONTAINS
                           "convergence criterion of the next inner optimization is set to this "// &
                           "fraction of the current-row residual, but never looser than the previous "// &
                           "criterion and never tighter than EPS_ERROR. Zero means every inner "// &
-                          "optimization is converged to EPS_ERROR.", &
+                          "optimization is converged to EPS_ERROR. The first inner optimization "// &
+                          "is loose (LOOSE_EPS_SCF) only when NSTEPS_STRENGTH > 1.", &
                           usage="MULTIPLIER_INNER_TOL_FACTOR 0.1", &
                           default_r_val=0.1_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      ! aeph: secant dual step
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_SECANT", &
+                          description="Used with MULTIPLIER_COMPONENT. Replace the fixed dual step "// &
+                          "mu_J <- mu_J + 2*(lambda - shift)*y_J by a per-constraint secant step. With "// &
+                          "nu_J = mu_J + 2*lambda*y_J the linear dual model is nu_J = mu*_J - K_J*y_J, "// &
+                          "independent of lambda; K_J is measured from the last two outer iterations "// &
+                          "and the step is mu_J <- nu_J + K_J*y_J. Until K_J is measured (first update, "// &
+                          "small or noisy changes of y_J) K_J = -2*shift, i.e. the fixed step. The "// &
+                          "extrapolation beyond the fixed step is limited by MULTIPLIER_SECANT_TRUST. "// &
+                          "lambda grows only if the residual rises, if K_J <= -lambda for the largest "// &
+                          "overlap (penalty below the convexity threshold), or if the residual misses "// &
+                          "MULTIPLIER_SAFEGUARD_RATIO after a full secant step or without a measurable "// &
+                          "secant.", &
+                          usage="MULTIPLIER_SECANT .TRUE.", default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_SECANT_TRUST", &
+                          description="Used with MULTIPLIER_SECANT. The part of the secant step beyond "// &
+                          "the fixed step, |(K_J - K0)*y_J|, is limited to this multiple of the change "// &
+                          "of nu_J between the last two outer iterations. Must be positive.", &
+                          usage="MULTIPLIER_SECANT_TRUST 4.0", &
+                          default_r_val=4.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="COSINE_ON_DOUBLES", &
+                          description="Used with MULTIPLIER_COMPONENT (AL_COS method; also switches "// &
+                          "on PRECONDITIONER_PENALTY). For a spin block whose "// &
+                          "canonical guesses differ in r >= 2 orbitals, add lambda_k*c_k + "// &
+                          "(mu/2)*c_k^2 on the smallest signed principal cosine (the two smallest "// &
+                          "for a true double: c_2 < 2*c_1 + 2E-4, from the second outer iteration), "// &
+                          "on top of the signed overlap multipliers. Pairs with r < 2 are "// &
+                          "unchanged. mu starts at INTERSTATE_NON_PENALTY_STRENGTH and doubles "// &
+                          "only when the largest |c_k| of that block misses "// &
+                          "MULTIPLIER_SAFEGUARD_RATIO. The state is still accepted on max|g_IJ|.", &
+                          usage="COSINE_ON_DOUBLES .TRUE.", default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 

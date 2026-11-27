@@ -119,7 +119,7 @@ CONTAINS
                                                             jj, GS_multips, nmultips 
       INTEGER, DIMENSION(:), POINTER                     :: tmplist
       INTEGER, DIMENSION(:), ALLOCATABLE                 :: nstates
-      LOGICAL                                            :: explicit
+      LOGICAL                                            :: explicit, l_in
       TYPE(section_vals_type), POINTER                   :: tidft_pcg_optimizer_section, &
                                                             tidft_section, &
                                                             penalty_section, WF_guess_section
@@ -167,7 +167,8 @@ CONTAINS
           .NOT. tidft_env%loss_function_components(3)) THEN
          CPABORT("AUGMENTED_COMPONENT requires INTERSTATE_COMPONENT=.TRUE.")
       ENDIF
-      ! signed-overlap multiplier term (component 5)
+      ! signed-overlap multiplier term (component 5). MULTIPLIER_COMPONENT selects the method:
+      ! FALSE = original penalty, TRUE = multipliers (AL_RZK), + COSINE_ON_DOUBLES = AL_COS
       CALL section_vals_val_get(tidft_section, &
               "MULTIPLIER_COMPONENT", &
               l_val=tidft_env%multiplier_component)
@@ -245,6 +246,17 @@ CONTAINS
       ! CINDY 
       CALL section_vals_val_get(tidft_pcg_optimizer_section, "PREC_WEIGHT_OVERLAP", &
                                 r_val=tidft_env%weight_alpha_prec)
+      ! aeph: 2b - Gauss-Newton interstate penalty term in the preconditioner
+      ! on only in the AL_COS method (MULTIPLIER_COMPONENT and PENALTY%COSINE_ON_DOUBLES)
+      CALL section_vals_val_get(tidft_pcg_optimizer_section, "PRECONDITIONER_PENALTY", l_val=l_in)
+      CALL section_vals_val_get(tidft_section, "PENALTY%COSINE_ON_DOUBLES", l_val=tidft_env%prec_penalty)
+      tidft_env%prec_penalty = tidft_env%prec_penalty .AND. tidft_env%multiplier_component
+      IF (l_in .NEQV. tidft_env%prec_penalty) &
+         CPWARN("PRECONDITIONER_PENALTY is ignored: MULTIPLIER_COMPONENT and COSINE_ON_DOUBLES set it")
+      IF (tidft_env%prec_penalty .AND. &
+          (tidft_env%numerical_gradient .OR. .NOT. tidft_env%state_by_state)) THEN
+         CPWARN("PRECONDITIONER_PENALTY is inactive with NUMERICAL_GRADIENT or without STATE_BY_STATE")
+      ENDIF
 
       penalty_section => section_vals_get_subs_vals(tidft_section, "PENALTY")
 
@@ -295,6 +307,45 @@ CONTAINS
       CALL section_vals_val_get(penalty_section, &
                                 "MULTIPLIER_CURVATURE_SHIFT", &
                                 r_val=tidft_env%multiplier_curvature_shift)
+      ! aeph: automatic shift = Delta E of the starting MOs of each excited state
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_CURVATURE_AUTO", &
+                                l_val=tidft_env%multiplier_curvature_auto)
+      ! aeph: secant dual step
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_SECANT", &
+                                l_val=tidft_env%multiplier_secant)
+      CALL section_vals_val_get(penalty_section, &
+                                "MULTIPLIER_SECANT_TRUST", &
+                                r_val=tidft_env%multiplier_secant_trust)
+      CALL section_vals_val_get(penalty_section, &
+                                "COSINE_ON_DOUBLES", &
+                                l_val=tidft_env%cosine_on_doubles)
+      ! aeph: the multiplier settings are checked only when the multiplier term is used
+      IF (tidft_env%multiplier_component) THEN
+         ! aeph: a negative shift would enlarge the dual step
+         IF (tidft_env%multiplier_curvature_shift .LT. 0.0_dp) THEN
+            CPABORT("MULTIPLIER_CURVATURE_SHIFT must be >= 0")
+         ENDIF
+         IF (tidft_env%multiplier_curvature_auto .AND. &
+             tidft_env%multiplier_curvature_shift .GT. 0.0_dp) THEN
+            CPWARN("MULTIPLIER_CURVATURE_SHIFT is ignored with MULTIPLIER_CURVATURE_AUTO")
+         ENDIF
+         ! aeph: the safeguard multiplies C_P by |factor|; below 1 it would shrink C_P (0 -> 0/0)
+         IF (ABS(tidft_env%penalty_strength_inc_factor) .LT. 1.0_dp) THEN
+            CPABORT("MULTIPLIER_COMPONENT requires |PENALTY_STRENGTH_INCREASE_FACTOR| >= 1")
+         ENDIF
+         IF (.NOT. tidft_env%loss_function_components(1)) THEN
+            CPWARN("MULTIPLIER_COMPONENT makes no dual updates with ENERGY_COMPONENT=.FALSE.")
+         ENDIF
+         IF (tidft_env%multiplier_secant .AND. tidft_env%multiplier_secant_trust .LE. 0.0_dp) THEN
+            CPABORT("MULTIPLIER_SECANT_TRUST must be > 0")
+         ENDIF
+      ELSE IF (tidft_env%multiplier_curvature_auto .OR. tidft_env%multiplier_secant .OR. &
+               tidft_env%multiplier_curvature_shift .NE. 0.0_dp .OR. &
+               tidft_env%cosine_on_doubles) THEN
+         CPWARN("MULTIPLIER_CURVATURE_*/MULTIPLIER_SECANT/COSINE_ON_DOUBLES are ignored without MULTIPLIER_COMPONENT")
+      ENDIF
       CALL section_vals_val_get(penalty_section, &
                                 "MULTIPLIER_INNER_TOL_FACTOR", &
                                 r_val=tidft_env%multiplier_inner_tol_factor)
@@ -302,6 +353,11 @@ CONTAINS
       CALL section_vals_val_get(penalty_section, &
                                 "MULTIPLIER_MAX_ITER", &
                                 i_val=tidft_env%multiplier_max_iter)
+      ! aeph: the multiplier gradient divides by the interstate strength (0/0 at zero)
+      IF (tidft_env%multiplier_component .AND. &
+          tidft_env%interstate_nonorthogonality_penalty_coeff .LE. 0.0_dp) THEN
+         CPABORT("MULTIPLIER_COMPONENT requires INTERSTATE_NON_PENALTY_STRENGTH > 0")
+      ENDIF
 
       ! CINDY: Pass input from WF_GUESS section
       WF_guess_section => section_vals_get_subs_vals(tidft_section, "WF_GUESS")
@@ -861,6 +917,18 @@ CONTAINS
       DEALLOCATE(tidft_env%mat_phi_inv)
       DEALLOCATE(tidft_env%mat_phi)
       IF (ALLOCATED(tidft_env%overlap_multipliers)) DEALLOCATE(tidft_env%overlap_multipliers)
+      IF (ALLOCATED(tidft_env%guess_nocc)) DEALLOCATE(tidft_env%guess_nocc)
+      IF (ALLOCATED(tidft_env%guess_occ)) DEALLOCATE(tidft_env%guess_occ)
+      IF (ALLOCATED(tidft_env%cosine_rank)) DEALLOCATE(tidft_env%cosine_rank)
+      IF (ALLOCATED(tidft_env%cosine_mu)) DEALLOCATE(tidft_env%cosine_mu)
+      IF (ALLOCATED(tidft_env%cosine_dev)) DEALLOCATE(tidft_env%cosine_dev)
+      IF (ALLOCATED(tidft_env%cosine_lambda)) DEALLOCATE(tidft_env%cosine_lambda)
+      IF (ALLOCATED(tidft_env%cosine_c)) DEALLOCATE(tidft_env%cosine_c)
+      IF (ALLOCATED(tidft_env%cosine_W)) DEALLOCATE(tidft_env%cosine_W)
+      IF (ALLOCATED(tidft_env%cosine_q)) DEALLOCATE(tidft_env%cosine_q)
+      IF (ALLOCATED(tidft_env%cosine_u)) DEALLOCATE(tidft_env%cosine_u)
+      IF (ALLOCATED(tidft_env%cosine_v)) DEALLOCATE(tidft_env%cosine_v)
+      IF (ALLOCATED(tidft_env%cosine_have_vec)) DEALLOCATE(tidft_env%cosine_have_vec)
       DEALLOCATE(tidft_env%mat_phi_spin)
       DEALLOCATE(tidft_env%e_states)
       DEALLOCATE(tidft_env%omega_intra)
@@ -1082,6 +1150,18 @@ CONTAINS
       DEALLOCATE(tidft_env%mat_phi_inv)
       DEALLOCATE(tidft_env%mat_phi)
       IF (ALLOCATED(tidft_env%overlap_multipliers)) DEALLOCATE(tidft_env%overlap_multipliers)
+      IF (ALLOCATED(tidft_env%guess_nocc)) DEALLOCATE(tidft_env%guess_nocc)
+      IF (ALLOCATED(tidft_env%guess_occ)) DEALLOCATE(tidft_env%guess_occ)
+      IF (ALLOCATED(tidft_env%cosine_rank)) DEALLOCATE(tidft_env%cosine_rank)
+      IF (ALLOCATED(tidft_env%cosine_mu)) DEALLOCATE(tidft_env%cosine_mu)
+      IF (ALLOCATED(tidft_env%cosine_dev)) DEALLOCATE(tidft_env%cosine_dev)
+      IF (ALLOCATED(tidft_env%cosine_lambda)) DEALLOCATE(tidft_env%cosine_lambda)
+      IF (ALLOCATED(tidft_env%cosine_c)) DEALLOCATE(tidft_env%cosine_c)
+      IF (ALLOCATED(tidft_env%cosine_W)) DEALLOCATE(tidft_env%cosine_W)
+      IF (ALLOCATED(tidft_env%cosine_q)) DEALLOCATE(tidft_env%cosine_q)
+      IF (ALLOCATED(tidft_env%cosine_u)) DEALLOCATE(tidft_env%cosine_u)
+      IF (ALLOCATED(tidft_env%cosine_v)) DEALLOCATE(tidft_env%cosine_v)
+      IF (ALLOCATED(tidft_env%cosine_have_vec)) DEALLOCATE(tidft_env%cosine_have_vec)
       DEALLOCATE(tidft_env%mat_phi_spin)
       DEALLOCATE(tidft_env%e_states)
 
