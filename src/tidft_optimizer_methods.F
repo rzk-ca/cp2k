@@ -751,13 +751,24 @@ CONTAINS
                   ! multisecant correction: corr = (-dM - H0 dG) (dG^T dG + eps)^-1 dG^T g
                   corr_vec(1:npairs) = 0.0_dp
                   IF (nhist .GT. 0) THEN
-                     g_norm = SQRT(SUM(gcur_vec(1:npairs)**2))
-                     eps_reg = (tidft_env%multiplier_secant_noise * g_norm)**2 + 1.0E-30_dp
                      DO ih = 1, nhist
                         rmat(1:npairs,ih) = -dm_hist(1:npairs,ih) - h0diag(1:npairs) * dg_hist(1:npairs,ih)
                         coef(ih) = SUM(dg_hist(1:npairs,ih) * gcur_vec(1:npairs))
                      ENDDO
                      gram(1:nhist,1:nhist) = MATMUL(TRANSPOSE(dg_hist(1:npairs,1:nhist)), dg_hist(1:npairs,1:nhist))
+                     ! Tikhonov regularization of the least-squares fit, relative to the
+                     ! stored responses. It must not be tied to the size of the overlaps:
+                     ! that mixes the fraction eps/(dG^2 + eps) of the model step H0*g
+                     ! into the secant step, which then overshoots whenever the model
+                     ! factor is too large. A single stored response needs none, because
+                     ! it is stored only if it is measurable: the step is the plain secant.
+                     eps_reg = 0.0_dp
+                     IF (nhist .GT. 1) THEN
+                        DO ih = 1, nhist
+                           eps_reg = MAX(eps_reg, gram(ih,ih))
+                        ENDDO
+                        eps_reg = tidft_env%multiplier_secant_noise**2 * eps_reg
+                     ENDIF
                      DO ih = 1, nhist
                         gram(ih,ih) = gram(ih,ih) + eps_reg
                      ENDDO
@@ -826,6 +837,11 @@ CONTAINS
                tidft_env%interstate_nonorthogonality_penalty_coeff = &
                   tidft_env%interstate_nonorthogonality_penalty_coeff * &
                   ABS(tidft_env%penalty_strength_inc_factor)
+               ! restart the Jacobian model with the new penalty strength, as after a
+               ! wrong-sign response: the model factors were set for the old strength
+               ! and a response measured across the change is not a secant pair
+               hinv_set = .FALSE.
+               nhist = 0
             ENDIF
             residual_prev = residual
          ELSE IF (alm_on .AND. .NOT. alm_deferred) THEN
