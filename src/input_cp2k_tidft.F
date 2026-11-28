@@ -27,7 +27,8 @@ MODULE input_cp2k_tidft
         spd_inversion_dense_cholesky, spd_inversion_ls_hotelling, spd_inversion_ls_taylor, &
         trustr_cauchy, trustr_dogleg, trustr_steihaug, tidft_prec_zero, &
         tidft_prec_s, xalmo_trial_r0_out, xalmo_trial_simplex, tidft_prec_h_s, tidft_prec_qhq_s, &
-        tidft_prec_qhq_qsq, tidft_mult_constraint_det, tidft_mult_constraint_cosine
+        tidft_prec_qhq_qsq, tidft_mult_constraint_det, tidft_mult_constraint_cosine, &
+        tidft_mult_constraint_selective
    USE input_val_types,                 ONLY: char_t,&
                                               integer_t,&
                                               lchar_t,&
@@ -192,13 +193,27 @@ CONTAINS
                           "vanish exactly where the states are orthogonal and give the same energies; "// &
                           "the smallest cosine is not suppressed by the other principal cosines of "// &
                           "the pair, so the dual iteration converges also for pairs of states that "// &
-                          "differ by two orbitals in one spin channel.", &
+                          "differ by two orbitals in one spin channel. SELECTIVE_COSINE: every pair "// &
+                          "starts with the DETERMINANT multiplier, so the first inner optimization "// &
+                          "of a state is that of DETERMINANT; after each inner optimization a pair "// &
+                          "whose overlap is above PENALTY%MAX_NORM_PHI_OFF_DIAG and whose product "// &
+                          "P_IJ of the other principal cosines satisfies 2*lambda*P_IJ**2 < "// &
+                          "PENALTY%MULTIPLIER_CURVATURE_GUESS (a pair for which the determinant "// &
+                          "multiplier converges slowly) is switched to the SMALLEST_COSINE term with "// &
+                          "its multiplier converted as mu_J -> mu_J*P_IJ. A switched pair whose "// &
+                          "cosine does not decrease by PENALTY%COSINE_FALLBACK_RATIO is returned to "// &
+                          "the determinant multiplier for the rest of the state. The interstate "// &
+                          "penalty strength is raised only for the sake of determinant pairs and the "// &
+                          "strength of the quadratic term does not follow it. Not available with "// &
+                          "PENALTY%MULTIPLIER_ACCELERATION.", &
                           usage="MULTIPLIER_CONSTRAINT SMALLEST_COSINE", &
                           default_i_val=tidft_mult_constraint_det, &
-                          enum_c_vals=s2a("DETERMINANT", "SMALLEST_COSINE"), &
+                          enum_c_vals=s2a("DETERMINANT", "SMALLEST_COSINE", "SELECTIVE_COSINE"), &
                           enum_desc=s2a("Signed normalized determinant overlap.", &
-                                        "Signed smallest principal cosine with quadratic augmentation."), &
-                          enum_i_vals=(/tidft_mult_constraint_det, tidft_mult_constraint_cosine/))
+                                        "Signed smallest principal cosine with quadratic augmentation.", &
+                                        "Determinant overlap; smallest cosine only for stagnant pairs."), &
+                          enum_i_vals=(/tidft_mult_constraint_det, tidft_mult_constraint_cosine, &
+                                        tidft_mult_constraint_selective/))
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, name="INTRASTATE_COMPONENT", &
@@ -647,7 +662,9 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_CURVATURE_GUESS", &
                           description="Used with MULTIPLIER_ACCELERATION. Guess (Hartree) of the curvature "// &
                           "of the energy along the smallest principal cosine of a pair of states, used by "// &
-                          "the over-relaxed first multiplier step.", &
+                          "the over-relaxed first multiplier step. Also used with MULTIPLIER_CONSTRAINT "// &
+                          "SELECTIVE_COSINE: a pair above the overlap threshold is switched to the "// &
+                          "smallest-cosine term if 2*lambda*P_IJ**2 is below this value.", &
                           usage="MULTIPLIER_CURVATURE_GUESS 1.0", &
                           default_r_val=1.0_dp)
       CALL section_add_keyword(section, keyword)
@@ -712,20 +729,50 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="COSINE_PENALTY_STRENGTH", &
-                          description="Used with MULTIPLIER_CONSTRAINT SMALLEST_COSINE. Strength rho "// &
+                          description="Used with MULTIPLIER_CONSTRAINT SMALLEST_COSINE and "// &
+                          "SELECTIVE_COSINE. Strength rho "// &
                           "(Hartree) of the quadratic augmentation rho*c_IJ**2 of the smallest-cosine "// &
-                          "constraint of every pair of states. It supplies a stiffness 2*rho along "// &
+                          "constraint of a pair of states. It supplies a stiffness 2*rho along "// &
                           "the smallest principal cosine that does not depend on the other cosines "// &
                           "of the pair. A negative value (the default) means the initial "// &
-                          "INTERSTATE_NON_PENALTY_STRENGTH. It is multiplied together with the "// &
-                          "interstate penalty strength whenever the safeguard raises the latter.", &
+                          "INTERSTATE_NON_PENALTY_STRENGTH. With SMALLEST_COSINE it is multiplied "// &
+                          "together with the interstate penalty strength whenever the safeguard "// &
+                          "raises the latter. With SELECTIVE_COSINE it applies to the switched pairs "// &
+                          "only and does not follow the interstate penalty strength (see "// &
+                          "COSINE_MAX_STRENGTH_STEPS).", &
                           usage="COSINE_PENALTY_STRENGTH 10.0", &
                           default_r_val=-1.0_dp)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="COSINE_FALLBACK_RATIO", &
+                          description="Used with MULTIPLIER_CONSTRAINT SELECTIVE_COSINE. A pair that "// &
+                          "carries the smallest-cosine term and whose overlap is still above "// &
+                          "MAX_NORM_PHI_OFF_DIAG must decrease its constraint value c_IJ by this "// &
+                          "factor between two consecutive inner optimizations. Otherwise the term "// &
+                          "is taken to conflict with the constraint of another pair: the pair is "// &
+                          "returned to the determinant multiplier it would have had and is not "// &
+                          "switched again while the current state is optimized (see also "// &
+                          "COSINE_MAX_STRENGTH_STEPS).", &
+                          usage="COSINE_FALLBACK_RATIO 0.25", &
+                          default_r_val=0.25_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="COSINE_MAX_STRENGTH_STEPS", &
+                          description="Used with MULTIPLIER_CONSTRAINT SELECTIVE_COSINE. Number of "// &
+                          "times a pair that fails the COSINE_FALLBACK_RATIO test may instead have "// &
+                          "COSINE_PENALTY_STRENGTH multiplied by PENALTY_STRENGTH_INCREASE_FACTOR "// &
+                          "before it is returned to the determinant multiplier. The default of zero "// &
+                          "returns the pair at the first failure and never changes the strength.", &
+                          usage="COSINE_MAX_STRENGTH_STEPS 1", &
+                          default_i_val=0)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="COSINE_SMOOTH", &
-                          description="Used with MULTIPLIER_CONSTRAINT SMALLEST_COSINE. TRUE: the "// &
+                          description="Used with MULTIPLIER_CONSTRAINT SMALLEST_COSINE and "// &
+                          "SELECTIVE_COSINE. TRUE: the "// &
                           "smooth surrogate c = eps*[1 + SUM_k (1-lambda_k)**2/lambda_k]**(-1/2) of the "// &
                           "smallest cosine (lambda_k the squared principal cosines of the pair), which "// &
                           "has no kink where the two smallest cosines cross. FALSE: the plain signed "// &

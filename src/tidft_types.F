@@ -213,9 +213,24 @@ MODULE tidft_types
       ! the kind of the last dual step (0 first-order, 1 boosted, 2 secant)
       REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: mult_g_cur, mult_g_prev, mult_mu_prev
       INTEGER, DIMENSION(:), ALLOCATABLE                 :: mult_step_kind
-      ! constraint function of the multiplier term (tidft_mult_constraint_det or
-      ! tidft_mult_constraint_cosine of input_constants)
+      ! constraint function of the multiplier term (tidft_mult_constraint_det,
+      ! tidft_mult_constraint_cosine or tidft_mult_constraint_selective of input_constants)
       INTEGER                                            :: multiplier_constraint
+      ! selective smallest-cosine constraint: the determinant multiplier mu_J*g_IJ is
+      ! the term of every pair until a pair is found stagnant after an inner solve
+      ! (overlap above the threshold and a small product P_IJ of the other principal
+      ! cosines); such a pair then carries mu_J*c_IJ + rho*c_IJ**2 instead.
+      ! mult_cos_pair(J) - the pair (I,J) of the current state carries the cosine term
+      ! mult_ovl_cur(J)  - signed overlap g_IJ after the current inner solve (all pairs,
+      !                    whatever the constraint value stored in mult_g_cur)
+      ! cosine_fallback_ratio - a pair is returned to the determinant multiplier if its
+      !                    cosine did not decrease by this factor between two inner solves
+      ! cosine_max_strength_steps - number of times rho is raised for such a pair
+      !                    before it is returned to the determinant multiplier
+      LOGICAL, DIMENSION(:), ALLOCATABLE                 :: mult_cos_pair
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: mult_ovl_cur
+      REAL(KIND=dp)                                      :: cosine_fallback_ratio
+      INTEGER                                            :: cosine_max_strength_steps
       ! smallest-cosine constraint c_IJ = PROD_spin c_IJ,spin (signed smallest principal
       ! cosine or its smooth surrogate): strength rho of the quadratic augmentation
       ! rho*c_IJ**2 (current value and input value for the per-state reset) and the

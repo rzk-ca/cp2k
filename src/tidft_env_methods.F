@@ -43,7 +43,7 @@ MODULE tidft_env_methods
         almo_mat_distr_molecular, almo_scf_diag, almo_scf_skip, almo_scf_trustr, cg_hager_zhang, &
         do_bondparm_vdw, molecular_guess, tensor_orthogonal, virt_full, virt_minimal, virt_number, &
         xalmo_trial_r0_out, optimizer_pcg, optimizer_trustr, tidft_mult_constraint_det, &
-        tidft_mult_constraint_cosine
+        tidft_mult_constraint_cosine, tidft_mult_constraint_selective
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get
@@ -193,6 +193,10 @@ CONTAINS
       IF (tidft_env%multiplier_constraint .EQ. tidft_mult_constraint_cosine .AND. &
           .NOT. tidft_env%multiplier_component) THEN
          CPABORT("MULTIPLIER_CONSTRAINT SMALLEST_COSINE requires MULTIPLIER_COMPONENT=.TRUE.")
+      ENDIF
+      IF (tidft_env%multiplier_constraint .EQ. tidft_mult_constraint_selective .AND. &
+          .NOT. tidft_env%multiplier_component) THEN
+         CPABORT("MULTIPLIER_CONSTRAINT SELECTIVE_COSINE requires MULTIPLIER_COMPONENT=.TRUE.")
       ENDIF
       CALL section_vals_val_get(tidft_section, &
               "PRE_ORTHOGONALIZE_STATES", &
@@ -356,6 +360,20 @@ CONTAINS
       CALL section_vals_val_get(penalty_section, &
                                 "COSINE_SMOOTH", &
                                 l_val=tidft_env%cosine_smooth)
+      ! selective smallest-cosine constraint: contraction required of a switched pair
+      ! and the number of strength increases granted before it is switched back
+      CALL section_vals_val_get(penalty_section, &
+                                "COSINE_FALLBACK_RATIO", &
+                                r_val=tidft_env%cosine_fallback_ratio)
+      tidft_env%cosine_fallback_ratio = ABS(tidft_env%cosine_fallback_ratio)
+      CALL section_vals_val_get(penalty_section, &
+                                "COSINE_MAX_STRENGTH_STEPS", &
+                                i_val=tidft_env%cosine_max_strength_steps)
+      tidft_env%cosine_max_strength_steps = MAX(0, tidft_env%cosine_max_strength_steps)
+      IF (tidft_env%multiplier_constraint .EQ. tidft_mult_constraint_selective .AND. &
+          tidft_env%multiplier_acceleration) THEN
+         CPABORT("MULTIPLIER_CONSTRAINT SELECTIVE_COSINE is not implemented with MULTIPLIER_ACCELERATION")
+      ENDIF
 
       ! CINDY: Pass input from WF_GUESS section
       WF_guess_section => section_vals_get_subs_vals(tidft_section, "WF_GUESS")
@@ -516,6 +534,11 @@ CONTAINS
       ALLOCATE(tidft_env%mult_p_cur(nstates), tidft_env%mult_c_spin(nstates, nspins))
       tidft_env%mult_p_cur(:) = 1.0_dp
       tidft_env%mult_c_spin(:,:) = 0.0_dp
+      ! selective smallest-cosine constraint: which pairs carry the cosine term, and
+      ! the signed overlap of every pair
+      ALLOCATE(tidft_env%mult_cos_pair(nstates), tidft_env%mult_ovl_cur(nstates))
+      tidft_env%mult_cos_pair(:) = .FALSE.
+      tidft_env%mult_ovl_cur(:) = 0.0_dp
       tidft_env%mult_g_prev(:) = 0.0_dp
       tidft_env%mult_mu_prev(:) = 0.0_dp
       tidft_env%mult_step_kind(:) = 0
@@ -934,6 +957,8 @@ CONTAINS
       IF (ALLOCATED(tidft_env%mult_c_spin)) DEALLOCATE(tidft_env%mult_c_spin)
       IF (ALLOCATED(tidft_env%mult_cos_aj)) DEALLOCATE(tidft_env%mult_cos_aj)
       IF (ALLOCATED(tidft_env%mult_cos_ai)) DEALLOCATE(tidft_env%mult_cos_ai)
+      IF (ALLOCATED(tidft_env%mult_cos_pair)) DEALLOCATE(tidft_env%mult_cos_pair)
+      IF (ALLOCATED(tidft_env%mult_ovl_cur)) DEALLOCATE(tidft_env%mult_ovl_cur)
       DEALLOCATE(tidft_env%mat_phi_spin)
       DEALLOCATE(tidft_env%e_states)
       DEALLOCATE(tidft_env%omega_intra)
@@ -1163,6 +1188,8 @@ CONTAINS
       IF (ALLOCATED(tidft_env%mult_c_spin)) DEALLOCATE(tidft_env%mult_c_spin)
       IF (ALLOCATED(tidft_env%mult_cos_aj)) DEALLOCATE(tidft_env%mult_cos_aj)
       IF (ALLOCATED(tidft_env%mult_cos_ai)) DEALLOCATE(tidft_env%mult_cos_ai)
+      IF (ALLOCATED(tidft_env%mult_cos_pair)) DEALLOCATE(tidft_env%mult_cos_pair)
+      IF (ALLOCATED(tidft_env%mult_ovl_cur)) DEALLOCATE(tidft_env%mult_ovl_cur)
       DEALLOCATE(tidft_env%mat_phi_spin)
       DEALLOCATE(tidft_env%e_states)
 

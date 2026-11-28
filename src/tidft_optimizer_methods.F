@@ -43,7 +43,7 @@ MODULE tidft_optimizer_methods
         cg_dai_yuan, cg_fletcher, cg_fletcher_reeves, &
         cg_hager_zhang, cg_hestenes_stiefel, cg_liu_storey, cg_polak_ribiere, cg_zero, &
         tidft_prec_zero, tidft_prec_s, tidft_prec_h_s, tidft_prec_qhq_s, tidft_prec_qhq_qsq, &
-        tidft_mult_constraint_det, tidft_mult_constraint_cosine
+        tidft_mult_constraint_det, tidft_mult_constraint_cosine, tidft_mult_constraint_selective
    USE iterate_matrix,                  ONLY: determinant
    USE kinds,                           ONLY: default_path_length, default_string_length, dp
    USE machine,                         ONLY: m_walltime
@@ -312,6 +312,18 @@ CONTAINS
       ! smallest-cosine constraint
       LOGICAL                                            :: cos_on
       INTEGER                                            :: jcmax
+      ! selective smallest-cosine constraint: per pair of the current state, whether
+      ! the pair was returned to the determinant multiplier (and stays there), how
+      ! often the strength was raised for it, its |c_IJ| after the previous inner
+      ! solve, and the determinant multiplier it would have had without the switch
+      LOGICAL                                            :: sel_on, raise_rho, cp_safeguard, &
+                                                            pair_defined
+      INTEGER                                            :: jres, n_switched, n_returned
+      REAL(KIND=dp)                                      :: c_new, p_new, c_ratio, mu_cos
+      CHARACTER(LEN=5)                                   :: pair_tag
+      LOGICAL, DIMENSION(:), ALLOCATABLE                 :: cos_banned
+      INTEGER, DIMENSION(:), ALLOCATABLE                 :: cos_strikes
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: cos_c_ref, mu_det_alt
       ! aeph: the det(phi) threshold is read from input (tidft_env%eps_det, default 1.0E-10)
       !REAL(KIND=dp), PARAMETER                           :: tau_c  ! aeph: ALM decrease ratio for mu in tidft_env%alm_decrease_ratio
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -365,13 +377,25 @@ CONTAINS
       ! smallest-cosine constraint: the augmentation strength follows the interstate
       ! penalty strength, which is reset for every state
       cos_on = mult_on .AND. tidft_env%multiplier_constraint .EQ. tidft_mult_constraint_cosine
-      IF (cos_on) THEN
+      ! selective smallest-cosine constraint: every pair of a new state starts with the
+      ! determinant multiplier; the strength of the quadratic term is reset as well
+      sel_on = mult_on .AND. tidft_env%multiplier_constraint .EQ. tidft_mult_constraint_selective
+      IF (cos_on .OR. sel_on) THEN
          tidft_env%cosine_penalty_strength = tidft_env%cosine_penalty_strength0
          tidft_env%mult_g_cur(:) = 0.0_dp
          tidft_env%mult_p_cur(:) = 1.0_dp
       ENDIF
+      tidft_env%mult_cos_pair(:) = .FALSE.
+      tidft_env%mult_ovl_cur(:) = 0.0_dp
+      n_switched = 0
+      n_returned = 0
       ! work arrays of the accelerated dual update (pairs of the current state)
       npairs = MAX(cur_state - 1, 1)
+      ALLOCATE(cos_banned(npairs), cos_strikes(npairs), cos_c_ref(npairs), mu_det_alt(npairs))
+      cos_banned(:) = .FALSE.
+      cos_strikes(:) = 0
+      cos_c_ref(:) = 0.0_dp
+      mu_det_alt(:) = 0.0_dp
       mdepth = MAX(1, tidft_env%multiplier_secant_depth)
       ALLOCATE(dm_hist(npairs,mdepth), dg_hist(npairs,mdepth), rmat(npairs,mdepth), gram(mdepth,mdepth), &
                dfo_vec(npairs), dmu_vec(npairs), gcur_vec(npairs), muused_vec(npairs), dg_vec(npairs), &
@@ -427,7 +451,19 @@ CONTAINS
             WRITE (unit_nr, '(T2,A49,F30.10)') "INTERstate penalty strength:", &
                tidft_env%interstate_nonorthogonality_penalty_coeff
             IF (mult_on) THEN
-               IF (cos_on) THEN
+               IF (sel_on) THEN
+                  ! multiplier, the signed overlap g_IJ after the last inner solve and the
+                  ! term the pair carries in the coming one: det - determinant overlap,
+                  ! cos - smallest cosine (its c_IJ and P_IJ are printed after each solve)
+                  WRITE (unit_nr, '(T2,A49,F30.10)') "Smallest-cosine augmentation strength:", &
+                     tidft_env%cosine_penalty_strength
+                  DO stateJ = 1, cur_state - 1
+                     pair_tag = "  det"
+                     IF (tidft_env%mult_cos_pair(stateJ)) pair_tag = "  cos"
+                     WRITE (unit_nr, '(T2,A49,I6,F24.10,ES14.4,A5)') "State and its overlap multiplier:", stateJ, &
+                        tidft_env%overlap_multipliers(stateJ), tidft_env%mult_ovl_cur(stateJ), pair_tag
+                  ENDDO
+               ELSE IF (cos_on) THEN
                   ! multiplier and the constraint value c_IJ after the last inner solve
                   WRITE (unit_nr, '(T2,A49,F30.10)') "Smallest-cosine augmentation strength:", &
                      tidft_env%cosine_penalty_strength
@@ -505,6 +541,21 @@ CONTAINS
                   jcmax = MAXLOC(ABS(tidft_env%mult_g_cur(1:cur_state-1)), 1)
                   WRITE (unit_nr, '(T2,A19,ES30.6,ES30.6)') "MAX c_IJ, P_IJ:", &
                      tidft_env%mult_g_cur(jcmax), tidft_env%mult_p_cur(jcmax)
+               ELSE IF (sel_on) THEN
+                  ! the same for the pairs that carry the smallest-cosine term, if any,
+                  ! followed by c_IJ, P_IJ and g_IJ of each of them
+                  IF (ANY(tidft_env%mult_cos_pair(1:cur_state-1))) THEN
+                     jcmax = MAXLOC(ABS(tidft_env%mult_g_cur(1:cur_state-1)), 1, &
+                                    MASK=tidft_env%mult_cos_pair(1:cur_state-1))
+                     WRITE (unit_nr, '(T2,A19,ES30.6,ES30.6)') "MAX c_IJ, P_IJ:", &
+                        tidft_env%mult_g_cur(jcmax), tidft_env%mult_p_cur(jcmax)
+                     DO stateJ = 1, cur_state - 1
+                        IF (.NOT. tidft_env%mult_cos_pair(stateJ)) CYCLE
+                        WRITE (unit_nr, '(T2,A19,I6,ES18.6,ES18.6,ES18.6)') "COSINE PAIR:", stateJ, &
+                           tidft_env%mult_g_cur(stateJ), tidft_env%mult_p_cur(stateJ), &
+                           tidft_env%mult_ovl_cur(stateJ)
+                     ENDDO
+                  ENDIF
                ENDIF
             ENDIF
             IF (tidft_env%loss_function_components(4) .AND. &
@@ -652,7 +703,7 @@ CONTAINS
                dfo_vec(stateJ) = -2.0_dp * lambda_dual * &
                   SQRT(tidft_env%mat_phi(cur_state,cur_state) * tidft_env%mat_phi(stateJ,stateJ)) * &
                   tidft_env%mat_phi_inv(stateJ,cur_state)
-               IF (cos_on) THEN
+               IF (mult_pair_is_cosine(tidft_env, stateJ)) THEN
                   ! smallest-cosine constraint c_IJ = g_IJ / P_IJ with its quadratic term:
                   !   mu_J <- mu_J + 2*rho*c_IJ - 2*lambda*P_IJ*(Phi~^-1)_JI
                   dfo_vec(stateJ) = tidft_env%mult_p_cur(stateJ) * dfo_vec(stateJ) + &
@@ -665,6 +716,78 @@ CONTAINS
             ENDDO
             dmu_vec(1:npairs) = dfo_vec(1:npairs)
             tidft_env%mult_step_kind(1:npairs) = 0
+            IF (sel_on) THEN
+               ! Selective smallest-cosine constraint: decide for every pair which term it
+               ! carries in the next inner solve.
+               raise_rho = .FALSE.
+               DO stateJ = 1, npairs
+                  ! the determinant multiplier kept for a return follows the gauge
+                  mu_det_alt(stateJ) = gauge_sign * mu_det_alt(stateJ)
+                  IF (tidft_env%mult_cos_pair(stateJ)) THEN
+                     ! A pair that carries the smallest-cosine term must contract while its
+                     ! overlap is above the threshold: with a stiffness of 2*rho along the
+                     ! smallest cosine one dual update reduces c_IJ by k/(k + 2*rho) at
+                     ! least. If it does not, the term works against the constraint of
+                     ! another pair (antiparallel constraint gradients; the multipliers
+                     ! would grow together without moving the orbitals).
+                     c_new = ABS(tidft_env%mult_g_cur(stateJ))
+                     IF (ABS(tidft_env%mult_ovl_cur(stateJ)) .GT. tidft_env%allowed_max_norm_phi_mI .AND. &
+                         c_new .GT. tidft_env%cosine_fallback_ratio * cos_c_ref(stateJ)) THEN
+                        c_ratio = c_new / MAX(cos_c_ref(stateJ), TINY(1.0_dp))
+                        IF (cos_strikes(stateJ) .LT. tidft_env%cosine_max_strength_steps) THEN
+                           ! try a stiffer quadratic term first
+                           cos_strikes(stateJ) = cos_strikes(stateJ) + 1
+                           raise_rho = .TRUE.
+                           IF (unit_nr > 0) WRITE (unit_nr, '(T2,A,I5,A,ES12.4,A,ES11.3)') &
+                              "COSINE TERM KEPT: J =", stateJ, "  c_IJ =", tidft_env%mult_g_cur(stateJ), &
+                              "  ratio =", c_ratio
+                        ELSE
+                           ! return the pair to the determinant multiplier that it would have
+                           ! received when it was switched, and leave it there
+                           tidft_env%mult_cos_pair(stateJ) = .FALSE.
+                           cos_banned(stateJ) = .TRUE.
+                           n_returned = n_returned + 1
+                           dmu_vec(stateJ) = mu_det_alt(stateJ) - muused_vec(stateJ)
+                           IF (unit_nr > 0) WRITE (unit_nr, '(T2,A,I5,A,ES12.4,A,ES11.3,A,F14.8)') &
+                              "COSINE TERM OFF: J =", stateJ, "  c_IJ =", tidft_env%mult_g_cur(stateJ), &
+                              "  ratio =", c_ratio, "  mu ->", mu_det_alt(stateJ)
+                        ENDIF
+                     ENDIF
+                     cos_c_ref(stateJ) = c_new
+                  ELSE IF (.NOT. cos_banned(stateJ) .AND. &
+                           ABS(tidft_env%mult_ovl_cur(stateJ)) .GT. tidft_env%allowed_max_norm_phi_mI) THEN
+                     ! A pair that carries the determinant multiplier and is still above the
+                     ! threshold. The determinant penalty confines its smallest cosine with a
+                     ! stiffness of 2*lambda*P_IJ**2 only, and the dual update contracts as
+                     ! k/(k + 2*lambda*P_IJ**2): switch the pair if that stiffness is below the
+                     ! curvature guess k. The multiplier is converted so that the force on the
+                     ! orbitals is continuous: mu*g = mu*P*c to first order.
+                     CALL pair_cosine_values(tidft_env, cur_state, stateJ, c_new, p_new, pair_defined)
+                     IF (pair_defined) THEN
+                        ! the factor between the overlap of the penalty and the cosine (see
+                        ! the loss evaluation): g_IJ = c_IJ * P_IJ
+                        IF (ABS(c_new) .GT. 1.0E-100_dp) p_new = ABS(tidft_env%mult_ovl_cur(stateJ) / c_new)
+                        IF (2.0_dp * lambda_dual * p_new**2 .LT. tidft_env%multiplier_curvature_guess) THEN
+                           mu_det_alt(stateJ) = muused_vec(stateJ) + dfo_vec(stateJ)
+                           mu_cos = p_new * mu_det_alt(stateJ)
+                           dmu_vec(stateJ) = mu_cos - muused_vec(stateJ)
+                           tidft_env%mult_cos_pair(stateJ) = .TRUE.
+                           cos_c_ref(stateJ) = ABS(c_new)
+                           n_switched = n_switched + 1
+                           IF (unit_nr > 0) WRITE (unit_nr, '(T2,A,I5,A,ES12.4,A,ES12.4,A,ES11.3,A,F14.8)') &
+                              "COSINE TERM ON: J =", stateJ, "  g_IJ =", tidft_env%mult_ovl_cur(stateJ), &
+                              "  c_IJ =", c_new, "  P_IJ =", p_new, "  mu ->", mu_cos
+                        ENDIF
+                     ENDIF
+                  ENDIF
+               ENDDO
+               IF (raise_rho) THEN
+                  tidft_env%cosine_penalty_strength = tidft_env%cosine_penalty_strength * &
+                     ABS(tidft_env%penalty_strength_inc_factor)
+                  IF (unit_nr > 0) WRITE (unit_nr, '(T2,A,F16.6)') &
+                     "COSINE STRENGTH RAISED: rho =", tidft_env%cosine_penalty_strength
+               ENDIF
+            ENDIF
             IF (tidft_env%multiplier_acceleration) THEN
                ! Quasi-Newton step on the dual function for the pairs that limit
                ! convergence, dmu = H g, with H an approximation of minus the inverse
@@ -880,17 +1003,29 @@ CONTAINS
                ENDIF
             ELSE IF (residual_prev .GE. 0.0_dp .AND. &
                      residual .GT. tidft_env%multiplier_safeguard_ratio * residual_prev) THEN
-               tidft_env%interstate_nonorthogonality_penalty_coeff = &
-                  tidft_env%interstate_nonorthogonality_penalty_coeff * &
-                  ABS(tidft_env%penalty_strength_inc_factor)
-               ! the augmentation strength of the smallest-cosine constraint follows
-               IF (cos_on) tidft_env%cosine_penalty_strength = &
-                  tidft_env%cosine_penalty_strength * ABS(tidft_env%penalty_strength_inc_factor)
-               ! restart the Jacobian model with the new penalty strength, as after a
-               ! wrong-sign response: the model factors were set for the old strength
-               ! and a response measured across the change is not a secant pair
-               hinv_set = .FALSE.
-               nhist = 0
+               cp_safeguard = .TRUE.
+               IF (sel_on) THEN
+                  ! selective smallest-cosine constraint: if the pair that carries the
+                  ! residual carries the smallest-cosine term (just switched, or switched
+                  ! before and contracting), its own test above governs and the penalty
+                  ! strength, which serves the determinant pairs, is left alone
+                  jres = MAXLOC(ABS(tidft_env%mult_ovl_cur(1:npairs)), 1)
+                  IF (tidft_env%mult_cos_pair(jres)) cp_safeguard = .FALSE.
+               ENDIF
+               IF (cp_safeguard) THEN
+                  tidft_env%interstate_nonorthogonality_penalty_coeff = &
+                     tidft_env%interstate_nonorthogonality_penalty_coeff * &
+                     ABS(tidft_env%penalty_strength_inc_factor)
+                  ! the augmentation strength of the smallest-cosine constraint follows
+                  ! (not with the selective constraint)
+                  IF (cos_on) tidft_env%cosine_penalty_strength = &
+                     tidft_env%cosine_penalty_strength * ABS(tidft_env%penalty_strength_inc_factor)
+                  ! restart the Jacobian model with the new penalty strength, as after a
+                  ! wrong-sign response: the model factors were set for the old strength
+                  ! and a response measured across the change is not a secant pair
+                  hinv_set = .FALSE.
+                  nhist = 0
+               ENDIF
             ENDIF
             residual_prev = residual
          ELSE IF (alm_on .AND. .NOT. alm_deferred) THEN
@@ -961,7 +1096,12 @@ CONTAINS
          IF (mult_on) THEN
             print_string = "State and final overlap multiplier:"
             DO stateJ = 1, cur_state - 1
-               IF (cos_on) THEN
+               IF (sel_on) THEN
+                  pair_tag = "  det"
+                  IF (tidft_env%mult_cos_pair(stateJ)) pair_tag = "  cos"
+                  WRITE (unit_nr, '(T2,A54,I5,F20.10,ES14.4,A5)') print_string, stateJ, &
+                     tidft_env%overlap_multipliers(stateJ), tidft_env%mult_ovl_cur(stateJ), pair_tag
+               ELSE IF (cos_on) THEN
                   WRITE (unit_nr, '(T2,A54,I5,F20.10,ES14.4)') print_string, stateJ, &
                      tidft_env%overlap_multipliers(stateJ), tidft_env%mult_g_cur(stateJ)
                ELSE
@@ -972,6 +1112,11 @@ CONTAINS
             print_string = "Final current-row residual max|g_IJ|:"
             WRITE (unit_nr, '(T2,A59,ES20.6)') &
                print_string, tidft_env%multiplier_residual
+            IF (sel_on) THEN
+               print_string = "Pairs switched to the smallest cosine, returned:"
+               WRITE (unit_nr, '(T2,A59,I10,I10)') &
+                  print_string, n_switched, n_returned
+            ENDIF
          ENDIF
 
          WRITE (unit_nr, '(T2,A)') REPEAT("-", 79)
@@ -995,6 +1140,7 @@ CONTAINS
       tidft_env%tidft_optimizer_pcg%eps_error = save_eps_scf
       DEALLOCATE(dm_hist, dg_hist, rmat, gram, dfo_vec, dmu_vec, gcur_vec, muused_vec, dg_vec, &
                  dmuh_vec, eta_vec, h0diag, coef, corr_vec, active, accel_now, umask)
+      DEALLOCATE(cos_banned, cos_strikes, cos_c_ref, mu_det_alt)
 
    END SUBROUTINE penalty_strength_variation
 
@@ -1391,7 +1537,91 @@ CONTAINS
    END SUBROUTINE cosine_constraint_spin
 
 ! **************************************************************************************************
+!> \brief Tells whether the multiplier term of the pair (current state, stateJ) is the
+!>        smallest-cosine term mu_J*c_IJ + rho*c_IJ**2 or the determinant term mu_J*g_IJ:
+!>        all pairs with MULTIPLIER_CONSTRAINT SMALLEST_COSINE, the switched pairs
+!>        (tidft_env%mult_cos_pair) with SELECTIVE_COSINE, no pair with DETERMINANT
+!> \param tidft_env ...
+!> \param stateJ - a previous state
+!> \return ...
+!> \par History
+!>       2026.11 created [Rustam Z Khaliullin]
+! **************************************************************************************************
+   FUNCTION mult_pair_is_cosine(tidft_env, stateJ) RESULT(is_cosine)
+
+      TYPE(tidft_env_type), INTENT(IN)                   :: tidft_env
+      INTEGER, INTENT(IN)                                :: stateJ
+      LOGICAL                                            :: is_cosine
+
+      is_cosine = .FALSE.
+      IF (tidft_env%multiplier_constraint .EQ. tidft_mult_constraint_cosine) THEN
+         is_cosine = .TRUE.
+      ELSE IF (tidft_env%multiplier_constraint .EQ. tidft_mult_constraint_selective) THEN
+         IF (ALLOCATED(tidft_env%mult_cos_pair)) is_cosine = tidft_env%mult_cos_pair(stateJ)
+      ENDIF
+
+   END FUNCTION mult_pair_is_cosine
+
+! **************************************************************************************************
+!> \brief Smallest-cosine constraint value c_IJ = PROD_spin c_IJ,spin and the product P_IJ of the
+!>        other principal cosines (g_IJ = c_IJ*P_IJ) of the pair (stateI, stateJ), from the MO
+!>        overlap matrices of the last loss evaluation. Used after an inner optimization to
+!>        decide whether a pair that carries the determinant multiplier is to be switched to the
+!>        smallest-cosine term (the loss evaluation computes these numbers only for the pairs
+!>        that already carry it).
+!> \param tidft_env ...
+!> \param stateI - the current state
+!> \param stateJ - a previous state, stateJ < stateI
+!> \param c_IJ ...
+!> \param p_IJ ...
+!> \param defined - false if the two states have different numbers of orbitals in a spin channel
+!> \par History
+!>       2026.11 created [Rustam Z Khaliullin]
+! **************************************************************************************************
+   SUBROUTINE pair_cosine_values(tidft_env, stateI, stateJ, c_IJ, p_IJ, defined)
+
+      TYPE(tidft_env_type), INTENT(INOUT)                :: tidft_env
+      INTEGER, INTENT(IN)                                :: stateI, stateJ
+      REAL(KIND=dp), INTENT(OUT)                         :: c_IJ, p_IJ
+      LOGICAL, INTENT(OUT)                               :: defined
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'pair_cosine_values', &
+         routineP = moduleN//':'//routineN
+
+      INTEGER                                            :: idet, ispin, nI, nJ, nmax
+      REAL(KIND=dp)                                      :: c_tau, p_tau
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:,:)         :: a_j, a_i
+
+      c_IJ = 1.0_dp
+      p_IJ = 1.0_dp
+      defined = .TRUE.
+      ! the determinant used by the interstate term
+      idet = 1
+      IF (tidft_env%triplet_correction) idet = 2
+      nmax = 1
+      DO ispin = 1, tidft_env%nspins
+         nI = tidft_env%e_states(stateI)%slater_det(idet)%nelectrons_ab(ispin)
+         nJ = tidft_env%e_states(stateJ)%slater_det(idet)%nelectrons_ab(ispin)
+         IF (nI .NE. nJ) defined = .FALSE.
+         nmax = MAX(nmax, nI, nJ)
+      ENDDO
+      IF (.NOT. defined) RETURN
+
+      ! the gradient coefficients are not needed here
+      ALLOCATE(a_j(nmax, nmax), a_i(nmax, nmax))
+      DO ispin = 1, tidft_env%nspins
+         CALL cosine_constraint_spin(tidft_env, stateI, stateJ, idet, ispin, &
+                 tidft_env%cosine_smooth, c_tau, p_tau, a_j, a_i)
+         c_IJ = c_IJ * c_tau
+         p_IJ = p_IJ * p_tau
+      ENDDO
+      DEALLOCATE(a_j, a_i)
+
+   END SUBROUTINE pair_cosine_values
+
+! **************************************************************************************************
 !> \brief Adds the gradient of the smallest-cosine multiplier term SUM_J [mu_J c_IJ + rho c_IJ^2]
+!>        (the sum runs over the pairs that carry this term, see mult_pair_is_cosine)
 !>        of the current state I with respect to its orbitals T_I,spin (B x n) to mat_g:
 !>          SUM_J (mu_J + 2 rho c_IJ) c_IJ,spin' (S T_J A_J - S T_I A_I),
 !>        with spin' the other spin channel and A_J, A_I the dense coefficient matrices stored
@@ -1428,6 +1658,9 @@ CONTAINS
       ai_sum(:,:) = 0.0_dp
       any_pair = .FALSE.
       DO stateJ = 1, stateI - 1
+         ! only the pairs that carry the smallest-cosine term (the others carry the
+         ! determinant multiplier, whose gradient is part of the penalty gradient)
+         IF (.NOT. mult_pair_is_cosine(tidft_env, stateJ)) CYCLE
          nJ = tidft_env%e_states(stateJ)%slater_det(idet)%nelectrons_ab(ispin)
          IF (nJ .LE. 0) CYCLE
          weight = (tidft_env%overlap_multipliers(stateJ) + &
@@ -1989,7 +2222,7 @@ CONTAINS
                                                             DetDiagonalSigma, penalty_stateI, &
                                                             DetDiagonalPhi, &
                                                             determinant_spd, &
-                                                            multiplier_term, g_IJ, &
+                                                            multiplier_term, mult_det_term, g_IJ, &
                                                             mult_pair_factor, mult_self_factor, &
                                                             c_IJ, p_IJ, c_tau, p_tau
       ! aeph: old floor for det(Phi) 
@@ -2014,7 +2247,7 @@ CONTAINS
                                                             augmented_penalty_component,  &
                                                             alm_active, & ! aeph: ALM gate warm up
                                                             multiplier_term_on, &
-                                                            cosine_constraint_on, &
+                                                            any_cosine_pair, &
                                                             not_evaluated
 
       ! GRADIENT
@@ -2092,9 +2325,10 @@ CONTAINS
                            tidft_env%state_by_state .AND. &
                            (nstates .GT. 1)
       multiplier_term = 0.0_dp
-      ! smallest-cosine constraint instead of the determinant overlap
-      cosine_constraint_on = multiplier_term_on .AND. &
-                             tidft_env%multiplier_constraint .EQ. tidft_mult_constraint_cosine
+      ! the part of the multiplier term carried by determinant overlaps, and whether
+      ! any pair carries the smallest-cosine term instead (set by the loss evaluation)
+      mult_det_term = 0.0_dp
+      any_cosine_pair = .FALSE.
 
       !! RZK: templates for looping over the key matrices
       !! orbital matrices
@@ -2659,31 +2893,36 @@ CONTAINS
          !   -ln(1 - s^T A^-1 s) = ln(Phi_II * (Phi^-1)_II)
          IF (multiplier_term_on) THEN
             tidft_env%multiplier_residual = 0.0_dp
-            IF (cosine_constraint_on) THEN
-               ! Smallest-cosine constraint: c_IJ = PROD_spin c_IJ,spin with c_IJ,spin the
-               ! signed smallest principal cosine between the occupied subspaces of the two
-               ! states (or its smooth surrogate), g_IJ = c_IJ * P_IJ with P_IJ > 0 the
-               ! product of the other cosines; term = SUM_J [mu_J c_IJ + rho c_IJ^2].
-               ! The residual stays max_J |g_IJ|. The dense coefficient matrices of the
-               ! gradient of c_IJ,spin are stored per pair and spin for the gradient below.
-               idet_pen = 1
-               IF (tidft_env%triplet_correction) idet_pen = 2
-               IF (.NOT. ALLOCATED(tidft_env%mult_cos_aj)) THEN
-                  nmax = 1
-                  DO jstate = 1, SIZE(tidft_env%e_states)
-                     DO kspin = 1, nspins
-                        nmax = MAX(nmax, tidft_env%e_states(jstate)%slater_det(idet_pen)%nelectrons_ab(kspin))
+            ! Each pair (I,J) carries one of two terms (see mult_pair_is_cosine):
+            ! - the determinant term mu_J*g_IJ, or
+            ! - the smallest-cosine term mu_J*c_IJ + rho*c_IJ**2: c_IJ = PROD_spin c_IJ,spin
+            !   with c_IJ,spin the signed smallest principal cosine between the occupied
+            !   subspaces of the two states (or its smooth surrogate), g_IJ = c_IJ * P_IJ
+            !   with P_IJ > 0 the product of the other cosines. The dense coefficient
+            !   matrices of the gradient of c_IJ,spin are stored per pair and spin for
+            !   the gradient below.
+            ! The residual is max_J |g_IJ| in both cases.
+            idet_pen = 1
+            IF (tidft_env%triplet_correction) idet_pen = 2
+            DO stateJ = 1, nstates - 1
+               g_IJ = tidft_env%mat_phi(nstates, stateJ) / &
+                      SQRT(tidft_env%mat_phi(nstates, nstates) * tidft_env%mat_phi(stateJ, stateJ))
+               tidft_env%multiplier_residual = MAX(tidft_env%multiplier_residual, ABS(g_IJ))
+               IF (ALLOCATED(tidft_env%mult_ovl_cur)) tidft_env%mult_ovl_cur(stateJ) = g_IJ
+               IF (mult_pair_is_cosine(tidft_env, stateJ)) THEN
+                  any_cosine_pair = .TRUE.
+                  IF (.NOT. ALLOCATED(tidft_env%mult_cos_aj)) THEN
+                     nmax = 1
+                     DO jstate = 1, SIZE(tidft_env%e_states)
+                        DO kspin = 1, nspins
+                           nmax = MAX(nmax, tidft_env%e_states(jstate)%slater_det(idet_pen)%nelectrons_ab(kspin))
+                        ENDDO
                      ENDDO
-                  ENDDO
-                  ALLOCATE(tidft_env%mult_cos_aj(nmax, nmax, SIZE(tidft_env%e_states), nspins), &
-                           tidft_env%mult_cos_ai(nmax, nmax, SIZE(tidft_env%e_states), nspins))
-                  tidft_env%mult_cos_aj(:,:,:,:) = 0.0_dp
-                  tidft_env%mult_cos_ai(:,:,:,:) = 0.0_dp
-               ENDIF
-               DO stateJ = 1, nstates - 1
-                  g_IJ = tidft_env%mat_phi(nstates, stateJ) / &
-                         SQRT(tidft_env%mat_phi(nstates, nstates) * tidft_env%mat_phi(stateJ, stateJ))
-                  tidft_env%multiplier_residual = MAX(tidft_env%multiplier_residual, ABS(g_IJ))
+                     ALLOCATE(tidft_env%mult_cos_aj(nmax, nmax, SIZE(tidft_env%e_states), nspins), &
+                              tidft_env%mult_cos_ai(nmax, nmax, SIZE(tidft_env%e_states), nspins))
+                     tidft_env%mult_cos_aj(:,:,:,:) = 0.0_dp
+                     tidft_env%mult_cos_ai(:,:,:,:) = 0.0_dp
+                  ENDIF
                   c_IJ = 1.0_dp
                   p_IJ = 1.0_dp
                   DO ispin = 1, nspins
@@ -2700,16 +2939,22 @@ CONTAINS
                      tidft_env%cosine_penalty_strength * c_IJ**2
                   tidft_env%mult_g_cur(stateJ) = c_IJ
                   tidft_env%mult_p_cur(stateJ) = p_IJ
-               ENDDO
-            ELSE
-               DO stateJ = 1, nstates - 1
-                  g_IJ = tidft_env%mat_phi(nstates, stateJ) / &
-                         SQRT(tidft_env%mat_phi(nstates, nstates) * tidft_env%mat_phi(stateJ, stateJ))
+                  ! Selective constraint: the pair also keeps its determinant penalty, so
+                  ! the factor that matters is the one that relates the overlap of the
+                  ! penalty to the cosine, P_IJ = g_IJ / c_IJ. It equals the product of the
+                  ! other cosines times a constant when the normalization Phi_JJ kept for
+                  ! the previous state is not that of its present orbitals (the reference
+                  ! state is re-orthonormalized by the guess of the next state).
+                  IF (tidft_env%multiplier_constraint .EQ. tidft_mult_constraint_selective .AND. &
+                      ABS(c_IJ) .GT. 1.0E-100_dp) tidft_env%mult_p_cur(stateJ) = ABS(g_IJ / c_IJ)
+               ELSE
                   multiplier_term = multiplier_term + tidft_env%overlap_multipliers(stateJ) * g_IJ
-                  tidft_env%multiplier_residual = MAX(tidft_env%multiplier_residual, ABS(g_IJ))
+                  ! the part of the term that is built on the determinant overlaps
+                  ! enters the normalization term of the gradient
+                  mult_det_term = mult_det_term + tidft_env%overlap_multipliers(stateJ) * g_IJ
                   IF (ALLOCATED(tidft_env%mult_g_cur)) tidft_env%mult_g_cur(stateJ) = g_IJ
-               ENDDO
-            ENDIF
+               ENDIF
+            ENDDO
             tidft_env%schur_constraint = LOG(tidft_env%mat_phi(nstates, nstates) * &
                                              tidft_env%mat_phi_inv(nstates, nstates))
          ENDIF
@@ -3128,12 +3373,14 @@ CONTAINS
                                  ! the multiplier part mu_J/SQRT(Phi_II*Phi_JJ), folded into the
                                  ! overall factor -2*lambda_eff applied below
                                  mult_pair_factor = 0.0_dp
-                                 IF (multiplier_term_on .AND. .NOT. cosine_constraint_on .AND. &
-                                     stateJ .LT. stateI) THEN
-                                    mult_pair_factor = tidft_env%overlap_multipliers(stateJ) / &
-                                       SQRT(tidft_env%mat_phi(stateI,stateI) * &
-                                            tidft_env%mat_phi(stateJ,stateJ)) / &
-                                       (-2.0_dp * lambda_eff)
+                                 IF (multiplier_term_on .AND. stateJ .LT. stateI) THEN
+                                    ! only for the pairs that carry the determinant multiplier
+                                    IF (.NOT. mult_pair_is_cosine(tidft_env, stateJ)) THEN
+                                       mult_pair_factor = tidft_env%overlap_multipliers(stateJ) / &
+                                          SQRT(tidft_env%mat_phi(stateI,stateI) * &
+                                               tidft_env%mat_phi(stateJ,stateJ)) / &
+                                          (-2.0_dp * lambda_eff)
+                                    ENDIF
                                  ENDIF
                                  CALL dbcsr_scale(tempOO2, &
                                          tidft_env%mat_phi_spin(stateJ,stateI,opposite_spin) * &
@@ -3174,10 +3421,11 @@ CONTAINS
                      IF ( .NOT.(tidft_env%triplet_correction .AND. idet.EQ.1) ) THEN
 
                         ! Normalization term: 2*lambda from the penalty minus SUM_J mu_J*g_IJ
-                        ! from the multiplier term, folded into the factor -2*lambda_eff below
+                        ! from the multiplier term (the pairs that carry the determinant
+                        ! multiplier only), folded into the factor -2*lambda_eff below
                         mult_self_factor = 1.0_dp
-                        IF (multiplier_term_on .AND. .NOT. cosine_constraint_on) &
-                           mult_self_factor = 1.0_dp - multiplier_term/(2.0_dp*lambda_eff)
+                        IF (multiplier_term_on) &
+                           mult_self_factor = 1.0_dp - mult_det_term/(2.0_dp*lambda_eff)
                         CALL dbcsr_add(mat_g_inter(stateI, ispin), STsiginv, 1.0_dp, -mult_self_factor)
                         ! aeph: original scaling kept for reference/testing
                         !CALL dbcsr_scale(mat_g_inter(stateI, ispin), &
@@ -3186,9 +3434,9 @@ CONTAINS
                         CALL dbcsr_scale(mat_g_inter(stateI, ispin), & 
                                 -2.0_dp*lambda_eff)
                         ! smallest-cosine constraint: add the gradient of
-                        ! SUM_J [mu_J c_IJ + rho c_IJ^2] with respect to the orbitals
-                        ! of the current state in this spin channel
-                        IF (cosine_constraint_on) THEN
+                        ! SUM_J [mu_J c_IJ + rho c_IJ^2] (pairs that carry this term) with
+                        ! respect to the orbitals of the current state in this spin channel
+                        IF (multiplier_term_on .AND. any_cosine_pair) THEN
                            CALL cosine_constraint_gradient(tidft_env, stateI, idet, ispin, &
                                    mat_g_inter(stateI, ispin))
                         ENDIF
@@ -3400,10 +3648,11 @@ CONTAINS
                   "-", &
                   tidft_env%multiplier_residual, &
                   tidft_env%schur_constraint
-               ! smallest-cosine constraint per pair: columns are mu_J, c_IJ, -, P_IJ,
-               ! c_IJ*P_IJ (which must equal the overlap g_IJ)
-               IF (cosine_constraint_on) THEN
+               ! smallest-cosine constraint per pair that carries it: columns are mu_J,
+               ! c_IJ, -, P_IJ, c_IJ*P_IJ (which must equal the overlap g_IJ)
+               IF (any_cosine_pair) THEN
                   DO stateJ = 1, nstates - 1
+                     IF (.NOT. mult_pair_is_cosine(tidft_env, stateJ)) CYCLE
                      WRITE (loss_unit_nr, '(T2,A17,I3,ES10.2,F19.7,A10,ES10.2,ES10.2)') &
                         "COSINE-CONSTR", &
                         stateJ, &
