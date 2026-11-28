@@ -1057,6 +1057,9 @@ MODULE input_constants
                                    tidft_prec_qhq_s = 2, &
                                    tidft_prec_qhq_qsq = 3, &
                                    tidft_prec_s = 4
+   ! constraint function carried by the TIDFT interstate multipliers
+   INTEGER, PARAMETER, PUBLIC   :: tidft_mult_constraint_det = 1, &
+                                   tidft_mult_constraint_cosine = 2
 
    ! spd matrix inversion algorithm
    INTEGER, PARAMETER, PUBLIC   :: spd_inversion_ls_hotelling = 0, &

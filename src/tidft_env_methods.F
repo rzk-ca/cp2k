@@ -42,7 +42,8 @@ MODULE tidft_env_methods
         almo_domain_layout_atomic, almo_domain_layout_molecular, almo_frz_crystal, &
         almo_mat_distr_molecular, almo_scf_diag, almo_scf_skip, almo_scf_trustr, cg_hager_zhang, &
         do_bondparm_vdw, molecular_guess, tensor_orthogonal, virt_full, virt_minimal, virt_number, &
-        xalmo_trial_r0_out, optimizer_pcg, optimizer_trustr
+        xalmo_trial_r0_out, optimizer_pcg, optimizer_trustr, tidft_mult_constraint_det, &
+        tidft_mult_constraint_cosine
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get
@@ -184,6 +185,14 @@ CONTAINS
               l_val=tidft_env%state_by_state)
       IF (tidft_env%multiplier_component .AND. .NOT. tidft_env%state_by_state) THEN
          CPABORT("MULTIPLIER_COMPONENT requires STATE_BY_STATE=.TRUE.")
+      ENDIF
+      ! constraint function carried by the multipliers
+      CALL section_vals_val_get(tidft_section, &
+              "MULTIPLIER_CONSTRAINT", &
+              i_val=tidft_env%multiplier_constraint)
+      IF (tidft_env%multiplier_constraint .EQ. tidft_mult_constraint_cosine .AND. &
+          .NOT. tidft_env%multiplier_component) THEN
+         CPABORT("MULTIPLIER_CONSTRAINT SMALLEST_COSINE requires MULTIPLIER_COMPONENT=.TRUE.")
       ENDIF
       CALL section_vals_val_get(tidft_section, &
               "PRE_ORTHOGONALIZE_STATES", &
@@ -336,6 +345,17 @@ CONTAINS
                                 i_val=tidft_env%multiplier_secant_depth)
       tidft_env%multiplier_secant_depth = MAX(1, tidft_env%multiplier_secant_depth)
       tidft_env%multiplier_step_max = ABS(tidft_env%multiplier_step_max)
+      ! smallest-cosine constraint: strength of the quadratic augmentation (a negative
+      ! input means the initial interstate penalty strength) and the surrogate switch
+      CALL section_vals_val_get(penalty_section, &
+                                "COSINE_PENALTY_STRENGTH", &
+                                r_val=tidft_env%cosine_penalty_strength)
+      IF (tidft_env%cosine_penalty_strength .LT. 0.0_dp) &
+         tidft_env%cosine_penalty_strength = tidft_env%interstate_nonorthogonality_penalty_coeff
+      tidft_env%cosine_penalty_strength0 = tidft_env%cosine_penalty_strength
+      CALL section_vals_val_get(penalty_section, &
+                                "COSINE_SMOOTH", &
+                                l_val=tidft_env%cosine_smooth)
 
       ! CINDY: Pass input from WF_GUESS section
       WF_guess_section => section_vals_get_subs_vals(tidft_section, "WF_GUESS")
@@ -491,6 +511,11 @@ CONTAINS
       ALLOCATE(tidft_env%mult_g_cur(nstates), tidft_env%mult_g_prev(nstates), &
                tidft_env%mult_mu_prev(nstates), tidft_env%mult_step_kind(nstates))
       tidft_env%mult_g_cur(:) = 0.0_dp
+      ! smallest-cosine constraint: P_IJ and the spin components c_IJ,spin per pair
+      ! (the dense gradient coefficients are allocated at the first evaluation)
+      ALLOCATE(tidft_env%mult_p_cur(nstates), tidft_env%mult_c_spin(nstates, nspins))
+      tidft_env%mult_p_cur(:) = 1.0_dp
+      tidft_env%mult_c_spin(:,:) = 0.0_dp
       tidft_env%mult_g_prev(:) = 0.0_dp
       tidft_env%mult_mu_prev(:) = 0.0_dp
       tidft_env%mult_step_kind(:) = 0
@@ -905,6 +930,10 @@ CONTAINS
       IF (ALLOCATED(tidft_env%mult_g_prev)) DEALLOCATE(tidft_env%mult_g_prev)
       IF (ALLOCATED(tidft_env%mult_mu_prev)) DEALLOCATE(tidft_env%mult_mu_prev)
       IF (ALLOCATED(tidft_env%mult_step_kind)) DEALLOCATE(tidft_env%mult_step_kind)
+      IF (ALLOCATED(tidft_env%mult_p_cur)) DEALLOCATE(tidft_env%mult_p_cur)
+      IF (ALLOCATED(tidft_env%mult_c_spin)) DEALLOCATE(tidft_env%mult_c_spin)
+      IF (ALLOCATED(tidft_env%mult_cos_aj)) DEALLOCATE(tidft_env%mult_cos_aj)
+      IF (ALLOCATED(tidft_env%mult_cos_ai)) DEALLOCATE(tidft_env%mult_cos_ai)
       DEALLOCATE(tidft_env%mat_phi_spin)
       DEALLOCATE(tidft_env%e_states)
       DEALLOCATE(tidft_env%omega_intra)
@@ -1130,6 +1159,10 @@ CONTAINS
       IF (ALLOCATED(tidft_env%mult_g_prev)) DEALLOCATE(tidft_env%mult_g_prev)
       IF (ALLOCATED(tidft_env%mult_mu_prev)) DEALLOCATE(tidft_env%mult_mu_prev)
       IF (ALLOCATED(tidft_env%mult_step_kind)) DEALLOCATE(tidft_env%mult_step_kind)
+      IF (ALLOCATED(tidft_env%mult_p_cur)) DEALLOCATE(tidft_env%mult_p_cur)
+      IF (ALLOCATED(tidft_env%mult_c_spin)) DEALLOCATE(tidft_env%mult_c_spin)
+      IF (ALLOCATED(tidft_env%mult_cos_aj)) DEALLOCATE(tidft_env%mult_cos_aj)
+      IF (ALLOCATED(tidft_env%mult_cos_ai)) DEALLOCATE(tidft_env%mult_cos_ai)
       DEALLOCATE(tidft_env%mat_phi_spin)
       DEALLOCATE(tidft_env%e_states)
 

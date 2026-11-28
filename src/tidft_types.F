@@ -213,6 +213,24 @@ MODULE tidft_types
       ! the kind of the last dual step (0 first-order, 1 boosted, 2 secant)
       REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: mult_g_cur, mult_g_prev, mult_mu_prev
       INTEGER, DIMENSION(:), ALLOCATABLE                 :: mult_step_kind
+      ! constraint function of the multiplier term (tidft_mult_constraint_det or
+      ! tidft_mult_constraint_cosine of input_constants)
+      INTEGER                                            :: multiplier_constraint
+      ! smallest-cosine constraint c_IJ = PROD_spin c_IJ,spin (signed smallest principal
+      ! cosine or its smooth surrogate): strength rho of the quadratic augmentation
+      ! rho*c_IJ**2 (current value and input value for the per-state reset) and the
+      ! surrogate switch
+      REAL(KIND=dp)                                      :: cosine_penalty_strength
+      REAL(KIND=dp)                                      :: cosine_penalty_strength0
+      LOGICAL                                            :: cosine_smooth
+      ! per pair (I,J) of the smallest-cosine constraint: P_IJ = g_IJ / c_IJ (the
+      ! product of the other principal cosines), the spin components c_IJ,spin, and
+      ! the dense coefficient matrices of the gradient of c_IJ,spin with respect to
+      ! the orbitals of the current state, dc/dT_I = S T_J A_J - S T_I A_I
+      ! (mult_g_cur holds c_IJ itself when this constraint is active)
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: mult_p_cur
+      REAL(KIND=dp), DIMENSION(:,:), ALLOCATABLE         :: mult_c_spin
+      REAL(KIND=dp), DIMENSION(:,:,:,:), ALLOCATABLE     :: mult_cos_aj, mult_cos_ai
       ! residual of the current row, max_J |g_IJ|, and the Schur-complement
       ! part of the constraint that belongs to the current state,
       ! -ln(1 - s^T A^-1 s) = ln(Phi_II * (Phi^-1)_II)

@@ -27,7 +27,7 @@ MODULE input_cp2k_tidft
         spd_inversion_dense_cholesky, spd_inversion_ls_hotelling, spd_inversion_ls_taylor, &
         trustr_cauchy, trustr_dogleg, trustr_steihaug, tidft_prec_zero, &
         tidft_prec_s, xalmo_trial_r0_out, xalmo_trial_simplex, tidft_prec_h_s, tidft_prec_qhq_s, &
-        tidft_prec_qhq_qsq
+        tidft_prec_qhq_qsq, tidft_mult_constraint_det, tidft_mult_constraint_cosine
    USE input_val_types,                 ONLY: char_t,&
                                               integer_t,&
                                               lchar_t,&
@@ -178,6 +178,27 @@ CONTAINS
                           "cannot be combined with AUGMENTED_COMPONENT.", &
                           usage="MULTIPLIER_COMPONENT .TRUE.", default_l_val=.FALSE., &
                           lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MULTIPLIER_CONSTRAINT", &
+                          description="Constraint function carried by the multipliers of "// &
+                          "MULTIPLIER_COMPONENT. DETERMINANT: the signed normalized determinant "// &
+                          "overlap g_IJ of the current state with each previous state. "// &
+                          "SMALLEST_COSINE: the product over the spin channels of the signed smallest "// &
+                          "principal cosine between the occupied subspaces of the two states (or of "// &
+                          "its smooth surrogate, see PENALTY%COSINE_SMOOTH), augmented by the "// &
+                          "quadratic term PENALTY%COSINE_PENALTY_STRENGTH*c_IJ**2. Both functions "// &
+                          "vanish exactly where the states are orthogonal and give the same energies; "// &
+                          "the smallest cosine is not suppressed by the other principal cosines of "// &
+                          "the pair, so the dual iteration converges also for pairs of states that "// &
+                          "differ by two orbitals in one spin channel.", &
+                          usage="MULTIPLIER_CONSTRAINT SMALLEST_COSINE", &
+                          default_i_val=tidft_mult_constraint_det, &
+                          enum_c_vals=s2a("DETERMINANT", "SMALLEST_COSINE"), &
+                          enum_desc=s2a("Signed normalized determinant overlap.", &
+                                        "Signed smallest principal cosine with quadratic augmentation."), &
+                          enum_i_vals=(/tidft_mult_constraint_det, tidft_mult_constraint_cosine/))
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, name="INTRASTATE_COMPONENT", &
@@ -687,6 +708,30 @@ CONTAINS
                           "multiplier in one accelerated step.", &
                           usage="MULTIPLIER_STEP_MAX 1.0", &
                           default_r_val=1.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="COSINE_PENALTY_STRENGTH", &
+                          description="Used with MULTIPLIER_CONSTRAINT SMALLEST_COSINE. Strength rho "// &
+                          "(Hartree) of the quadratic augmentation rho*c_IJ**2 of the smallest-cosine "// &
+                          "constraint of every pair of states. It supplies a stiffness 2*rho along "// &
+                          "the smallest principal cosine that does not depend on the other cosines "// &
+                          "of the pair. A negative value (the default) means the initial "// &
+                          "INTERSTATE_NON_PENALTY_STRENGTH. It is multiplied together with the "// &
+                          "interstate penalty strength whenever the safeguard raises the latter.", &
+                          usage="COSINE_PENALTY_STRENGTH 10.0", &
+                          default_r_val=-1.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="COSINE_SMOOTH", &
+                          description="Used with MULTIPLIER_CONSTRAINT SMALLEST_COSINE. TRUE: the "// &
+                          "smooth surrogate c = eps*[1 + SUM_k (1-lambda_k)**2/lambda_k]**(-1/2) of the "// &
+                          "smallest cosine (lambda_k the squared principal cosines of the pair), which "// &
+                          "has no kink where the two smallest cosines cross. FALSE: the plain signed "// &
+                          "smallest cosine eps*cos(theta_1).", &
+                          usage="COSINE_SMOOTH .TRUE.", default_l_val=.TRUE., &
+                          lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
